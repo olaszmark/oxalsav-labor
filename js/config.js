@@ -9,7 +9,7 @@ window.LAB_CONFIG = {
    *    Leave it empty ("") to run in MOCK mode (no server, data stays in
    *    this browser). You can also force mock mode with ?mock=1 in the URL.
    * --------------------------------------------------------------------- */
-  API_URL: "",
+  API_URL: "https://script.google.com/macros/s/AKfycbxgXd3y3NeIp2A7JDL57DPLa2mc2kezfqAlKD4s8kV4W2ODMHeeTB70jNdxmzYNPA-ydQ/exec",
 
   /* ------------------------------------------------------------------------
    * 2) ★★★ PRESET NaOH VOLUMES (cm³) ★★★

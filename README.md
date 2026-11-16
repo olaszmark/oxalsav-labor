@@ -269,6 +269,7 @@ npm install                      # installs Playwright (dev only)
 npx playwright install chromium webkit  # downloads the headless browsers (first time only)
 npm test                         # 51 unit tests: parsing, derivative, interpolation, rows, axes, your real dataset + Code.gs against fake Google services
 npm run test:ui                  # 58 end-to-end checks (~5 min), screenshots in tests/ui/screenshots/
+node tests/live-check.mjs https://<user>.github.io/<repo>/ --expect-api   # smoke test of the LIVE site on phone-sized browsers
 ```
 
 The UI tests run the real frontend against `Code.gs` itself. It is executed in Node with fake `SpreadsheetApp`, `LockService` and `CacheService`
