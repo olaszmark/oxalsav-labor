@@ -6,7 +6,7 @@ Students then pick the two equivalence points themselves and submit. The teacher
 on a password-protected page. All user-facing text is in Hungarian.
 
 * **Frontend:** static HTML/CSS/JS with no build step and no external libraries, hosted on **GitHub Pages**.
-* **Backend:** a **Google Apps Script** web app and a **Google Sheet**, with one row per student (latest version only).
+* **Backend:** a **Google Apps Script** web app and a **Google Sheet**. Every save is appended as a new row (a log); the teacher page, the CSV exports and the optional **Összesítő** tab show each student's newest version.
 
 ---
 
@@ -79,7 +79,8 @@ The password lives only on the server. It is never in the frontend code or on Gi
 1. Back in the **Editor** (`< >` icon), choose the function **`setup`** in the toolbar dropdown and click **Run**.
 2. Google asks for authorization: **Review permissions** → choose your account → *"Google hasn't verified this app"* → **Advanced** → **Go to … (unsafe)** → **Allow**. This warning is normal for your own scripts.
 3. The execution log should say `Sheet "Adatok" OK. TEACHER_PASSWORD is set.` A tab named **Adatok** now exists in the Sheet.
-4. Select **`selfTest`** → **Run**. The log must end with **`SELF TEST PASSED`**. The test row is deleted automatically.
+4. Select **`selfTest`** → **Run**. The log must end with **`SELF TEST PASSED`**. The test rows are deleted automatically.
+5. Reload the Sheet: a menu **Oxálsav labor → Összesítő frissítése** appears (writes one row per student to the **Összesítő** tab; see section 7).
 
 ### 4.5 Deploy as a web app
 1. **Deploy → New deployment**.
@@ -148,7 +149,7 @@ Print the QR code large enough (at least 6 cm) or project it, and add the URL in
 - [ ] `selfTest` in Apps Script prints `SELF TEST PASSED`.
 - [ ] The Web app URL opens in a browser and shows `{"ok":true,…}`.
 - [ ] The student page on GitHub Pages shows **no** TESZT MÓD banner.
-- [ ] Enter a few values on your own phone and wait for **"Mentve hh:mm"** (green) in the top-right corner. Check that the row appears in the **Adatok** tab.
+- [ ] Enter a few values on your own phone and wait for **"Mentve hh:mm"** (green) in the top-right corner (autosave comes 10 s after your last change, at most once a minute; press **Beküldés** to save at once). Check that rows appear in the **Adatok** tab.
 - [ ] The teacher page opens with your password and the test student is visible. The detail view shows the table and plot.
 - [ ] **Several phones at once:** have 3–5 people (colleagues, or students at the start of class) use the page simultaneously, including at least one **iPhone (Safari)** and one **Android (Chrome)**. Try:
       a tap on the plot, a finger drag, a two-finger pinch, both EP selections, Beküldés, and a page reload (data must come back).
@@ -157,8 +158,9 @@ Print the QR code large enough (at least 6 cm) or project it, and add the URL in
       the changed value must be visible in the detail view within a few seconds, without reopening the student page.
 - [ ] **Scrolling on a small phone** (e.g. iPhone SE or any phone with a ~4,7" screen), portrait and landscape: scroll from the top of the page
       to the Beküldés button and back by swiping *beside* the plot. You must never get stuck.
-- [ ] Optional **load test** (needs Node.js): `node tests/load-test.mjs "<Web app URL>" 70 3`. It simulates 70 students saving 3 times each, all at once.
-      Expect **0 errors**. Then **delete the `TERHELÉSTESZT` rows** (or delete the whole *Adatok* tab, which is re-created automatically).
+- [ ] Optional **load test** (needs Node.js; run it against a **separate test deployment**, see section 9): `node tests/load-test.mjs "<test /exec URL>"`.
+      It simulates a realistic lab (70 students, a teacher polling the list, the Beküldés burst) and prints a PASS/FAIL table.
+      Then delete the whole *Adatok* tab of the test Sheet (it is re-created automatically).
 - [ ] Delete your own test rows from the **Adatok** tab.
 - [ ] The QR code is printed and scanned once with a phone.
 - [ ] `PRESET_VOLUMES` in `config.js` match the lab protocol.
@@ -171,7 +173,7 @@ Print the QR code large enough (at least 6 cm) or project it, and add the URL in
 **After the lab**
 - [ ] Export **CSV – összesítő** and **CSV – összes mérési adat**. They use semicolons and decimal commas, so they open directly in Hungarian Excel.
 - [ ] To start fresh for the next group, **rename** the *Adatok* tab (e.g. `2026-11-20 11.B`). A new empty *Adatok* tab is created at the next save.
-      The teacher page always shows the *Adatok* tab only.
+      The teacher page always shows the *Adatok* tab only. (Rename or delete an old *Összesítő* tab too; the menu creates a new one.)
 
 ---
 
@@ -195,10 +197,10 @@ If a student switches phones, the new phone creates a new row. The old row stays
 
 **Saving.**
 * Every change is written to **localStorage immediately**, so a reload or a closed tab restores everything.
-* A server save happens **5 s after the last change**. There is never more than one request in flight per student, and at most one save **every 20 s** per student.
-  If the server responds slowly (> 4 s), the interval automatically grows to 40–60 s.
-* Unchanged data is not re-sent. On failure the app retries with exponential backoff (5 s → 60 s, with jitter) and shows **"Hiba – újrapróbálás"**.
-* **Immediate saves** that bypass the 5 s / 20 s throttle:
+* A server autosave happens **10 s after the last change** (each change restarts this wait). There is never more than one request in flight per student, and at most one autosave **every 60 s** per student.
+* Unchanged data is not re-sent. On failure the app retries with exponential backoff (5 s → 60 s, with jitter).
+  If the server only answers **busy** (or times out / is overloaded), the phone keeps showing **"Mentés…"** for the first two retries; from the third failure, or for any other error, it shows **"Hiba – újrapróbálás"**.
+* **Immediate saves** that bypass the 10 s / 60 s throttle:
   * **Beküldés**, and **Mentés** or **Törlés** of an equivalence point. If another save is still on its way, the new one goes out right after it.
   * **The page becoming hidden or closed:** tab closed, app switch, screen lock, or the tab switcher (`visibilitychange → hidden` and `pagehide`).
     The latest state goes out at once with `navigator.sendBeacon`, or `fetch(…, {keepalive: true})` as a fallback, which both survive the page being frozen or unloaded.
@@ -206,18 +208,25 @@ If a student switches phones, the new phone creates a new row. The old row stays
     When the page becomes visible again, a normal confirmed save follows.
   * **The connection coming back** (the browser's `online` event): the failed save is retried at once, without waiting for the backoff.
 * **No overwriting with old data:** every save carries a revision number that increases on each send from that phone (kept in localStorage, with an in-memory fallback).
-  The server compares it inside the lock and ignores a lower revision that arrives late, so an older save can never overwrite a newer one.
+  Every save is stored as a new row; when reading, the server takes the row with the **highest revision** per student (for an equal revision, the later row).
+  An older save that arrives late is therefore stored but ignored, so it can never hide a newer one.
 
-**Quotas.** Apps Script allows about 30 simultaneous executions. With 70 students all typing continuously, the worst case is
-70 / 20 s ≈ 3.5 requests/s. At about 1 s per request that is roughly 4–5 concurrent executions. The `LockService` section of each
-save is short: a cached row lookup plus one `setValues`. The load test above checks that this holds on your real deployment.
+**Write path and quotas.** A save prepares everything first and then holds the script lock (`LockService`) only for one `appendRow`
+plus `SpreadsheetApp.flush()` – no reads. If the lock is not free within 8 s, the server answers `busy` and the app retries.
+Teacher reads (list, detail view, CSV) take **no** lock. Apps Script allows 30 simultaneous executions per user (Google's quota page).
+With the 10 s / 60 s timing, 70 students produce at most about 1,2 autosaves/s, and a Beküldés burst of 70 within a minute about the same.
+The realistic load test (section 9) measures what your deployment actually handles.
 
 **CORS.** Requests are `POST` with `Content-Type: text/plain`. That makes them "simple requests" with no preflight, which Apps Script couldn't answer anyway.
 The browser follows Apps Script's 302 redirect to `script.googleusercontent.com` automatically.
 
-**Sheet columns (tab "Adatok").** Kulcs · Név · Eszköz · Utolsó mentés · Beküldve · Beküldés ideje · Beküldés után módosítva ·
-1. EP V · 1. EP dĨ/dV · 2. EP V · 2. EP dĨ/dV · Mérési pontok · Rev · Állapot (JSON). The JSON column holds the full student state.
-You can sort or filter the sheet freely. Rows are found by key, not by position. Avoid editing column A (Kulcs).
+**Sheet tabs.**
+* **Adatok** – the log: **one row per save** (about 20–30 rows per student per lab). Columns: Kulcs · Név · Eszköz · Utolsó mentés (time of that save) ·
+  Beküldve · Beküldés ideje · Beküldés után módosítva · 1. EP V · 1. EP dĨ/dV · 2. EP V · 2. EP dĨ/dV · Mérési pontok · Rev · Állapot (JSON).
+  The JSON column holds the full student state of that save. You can sort or filter the tab freely: rows are matched by Kulcs and Rev, not by position.
+  Avoid editing columns A (Kulcs) and M (Rev). To delete one student, delete **all** of their rows (Data → Create a filter → Név).
+* **Összesítő** – optional, one row per student (newest version) plus *Mentések száma* (number of saves). Created or refreshed on demand with
+  the Sheet menu **Oxálsav labor → Összesítő frissítése**; it is not updated automatically (a live formula would slow down every save).
 
 **Derivative.** `(dĨ/dV)ᵢ = (Ĩᵢ₊₁ − Ĩᵢ₋₁) / (Vᵢ₊₁ − Vᵢ₋₁)`, computed on all rows where both V and Ĩ are valid numbers, **in increasing volume order**.
 * **Empty or invalid rows are skipped.** Such a row gets an empty derivative cell, and its neighbours are calculated from the nearest *filled* rows on either side.
@@ -268,17 +277,31 @@ and Android. The app has no CDN dependencies, so it keeps working if the school 
 npm install                      # installs Playwright (dev only)
 npx playwright install chromium webkit  # downloads the headless browsers (first time only)
 npm test                         # 51 unit tests: parsing, derivative, interpolation, rows, axes, your real dataset + Code.gs against fake Google services
-npm run test:ui                  # 58 end-to-end checks (~5 min), screenshots in tests/ui/screenshots/
+npm run test:ui                  # end-to-end checks (~8 min), screenshots in tests/ui/screenshots/
 node tests/live-check.mjs https://<user>.github.io/<repo>/ --expect-api   # smoke test of the LIVE site on phone-sized browsers
 ```
 
+**Load test** (against a separate **test** deployment – it writes `TERHELÉSTESZT` rows):
+
+```bash
+node tests/load-test.mjs "<test /exec URL>" --mode bench      # ~1 min: lock hold time per save (median, max), estimated capacity
+node tests/load-test.mjs "<test /exec URL>"                   # ~13 min: realistic lab + teacher poller + Beküldés burst, PASS/FAIL table
+node tests/load-test.mjs "<test /exec URL>" --mode stress     # the old all-at-once stress test
+```
+
+The realistic mode asks for the test deployment's teacher password with a hidden prompt (or reads `LOADTEST_PASSWORD`). Its pass criteria:
+nothing lost (the server's newest version equals every student's last save), every save eventually succeeds, all submitted,
+server delay (send → confirmed, incl. retries) p95 ≤ 30 s and max ≤ 90 s, Beküldés burst confirmed ≤ 2 min after the last press (p95 ≤ 30 s),
+≤ 10 % failed attempts, no student shows "Hiba" for more than 60 s in a row, teacher list ≤ 5 s, CSV "all" ≤ 20 s.
+It also reports the time until "Mentve" from the edit (which includes the deliberate 10 s / 60 s delay) and whether teacher reads slow down saves.
+
 The UI tests run the real frontend against `Code.gs` itself. It is executed in Node with fake `SpreadsheetApp`, `LockService` and `CacheService`
 behind a local server that imitates Apps Script's POST → 302 → GET behaviour. The tests use real touch events (tap, drag, two-finger pinch) through
-the Chrome DevTools Protocol. They also cover the 5 s / 20 s save throttling with production timings, a simulated server outage with automatic retry,
+the Chrome DevTools Protocol. They also cover the 10 s / 60 s save throttling with production timings, a simulated server outage with automatic retry,
 reload/restore, and the teacher list, detail view and CSV exports.
 
 They also test that the last change always reaches the server, with production timings:
-* Beküldés, EP Mentés and EP Törlés are sent at once, even inside the 20 s window and even while another save is in flight.
+* Beküldés, EP Mentés and EP Törlés are sent at once, even inside the 60 s window and even while another save is in flight.
 * Hiding the page or closing the tab sends a beacon, text/plain with no preflight. This also runs in **WebKit**, the Safari engine.
 * An older request arriving late is rejected as stale.
 * A save is retried at once when the connection returns.

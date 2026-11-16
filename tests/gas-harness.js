@@ -57,10 +57,18 @@ function makeSheet(name) {
       };
       return range;
     },
+    /** like Sheets: appends after the last row with content; writes must happen under the script lock */
+    appendRow(vals) {
+      if (sheet.lockCheck && !sheet.lockCheck()) throw new Error("appendRow without lock");
+      sheet.stats.appends++;
+      sheet.getRange(sheet.data.length + 1, 1, 1, vals.length).setValues([vals]);
+      return sheet;
+    },
+    clearContents() { this.data = []; return sheet; },
     setFrozenRows(n) { this.frozen = n; },
     setColumnWidth() {},
     deleteRow(r) { this.data.splice(r - 1, 1); },
-    stats: { reads: 0, writes: 0 }
+    stats: { reads: 0, writes: 0, appends: 0 }
   };
   return sheet;
 }
@@ -68,24 +76,28 @@ function makeSheet(name) {
 function loadGas(opts = {}) {
   const sheets = {};
   let lockHeld = 0;
+  let lockAcquisitions = 0;
   const cache = new Map();
   const props = { TEACHER_PASSWORD: opts.password === undefined ? "titok" : opts.password };
   const ss = {
     getSheetByName: (n) => sheets[n] || null,
     insertSheet: (n) => {
       sheets[n] = makeSheet(n);
-      sheets[n].lockCheck = () => lockHeld > 0;
+      if (n === "Adatok") sheets[n].lockCheck = () => lockHeld > 0; // the log tab is written only under the lock
       return sheets[n];
     }
   };
   const sandbox = {
     console: { log() {}, error() {} },
     JSON, Date, Math, Number, String, Array, Object, isFinite, isNaN,
-    SpreadsheetApp: { getActiveSpreadsheet: () => ss, flush() {} },
+    SpreadsheetApp: {
+      getActiveSpreadsheet: () => ss, flush() {},
+      getUi: () => { const m = { items: [], addItem(l, f) { m.items.push([l, f]); return m; }, addToUi() { sandbox.__menu = m; return m; } }; return { createMenu: (t) => { m.title = t; return m; } }; }
+    },
     LockService: {
       getScriptLock: () => ({
-        tryLock() { lockHeld++; return true; },
-        waitLock() { lockHeld++; },
+        tryLock() { lockHeld++; lockAcquisitions++; return true; },
+        waitLock() { lockHeld++; lockAcquisitions++; },
         releaseLock() { lockHeld--; }
       })
     },
@@ -112,6 +124,7 @@ function loadGas(opts = {}) {
     cache,
     props,
     isLockHeld: () => lockHeld > 0,
+    lockAcquisitions: () => lockAcquisitions,
     post(body) {
       const out = sandbox.doPost({ postData: { contents: typeof body === "string" ? body : JSON.stringify(body) } });
       return JSON.parse(out.content);

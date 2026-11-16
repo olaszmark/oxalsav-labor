@@ -30,10 +30,14 @@ window.LAB_CONFIG = {
   TITLE: "Oxálsav konduktometriás titrálása",
 
   /* ------------------------------------------------------------------------
-   * 4) Save timing (milliseconds). The defaults keep 70 simultaneous
-   *    students well inside Apps Script quotas – change only if needed.
+   * 4) Save timing (milliseconds) for normal autosaves. The defaults keep
+   *    70 simultaneous students within what the Apps Script backend can write
+   *    (measured – see README). Beküldés, EP Mentés/Törlés and hiding or
+   *    closing the page always save immediately. Change only if needed.
    * --------------------------------------------------------------------- */
-  SAVE_DEBOUNCE_MS: 5000,      // wait this long after the last change
-  SAVE_MIN_INTERVAL_MS: 20000, // at least this much time between two server saves
+  SAVE_DEBOUNCE_MS: 10000,     // wait this long after the last change
+  SAVE_MIN_INTERVAL_MS: 60000, // at least this much time between two server autosaves
+  SAVE_MAX_WAIT_MS: 60000,     // …but autosave no later than this after the first unsaved change,
+                               //    even while the student keeps typing
   REQUEST_TIMEOUT_MS: 25000    // give up a request after this long (then retry)
 };

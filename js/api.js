@@ -9,6 +9,8 @@
   var MOCK_DELAY = parseInt(params.get("delay") || "600", 10);     // ms
   var MOCK_DB = "oxalsav_mock_db";
   var MOCK_PASSWORD = "tanar";
+  // errors that only mean "the server is busy right now" (shown as "Mentés…" for the first retries)
+  var BUSY_CODES = /^(busy|timeout|http_429|http_503)$/;
 
   /* -------------------------------------------------------- transport */
 
@@ -141,6 +143,9 @@
     this.debounce = CFG.SAVE_DEBOUNCE_MS || 5000;
     this.minInterval = CFG.SAVE_MIN_INTERVAL_MS || 20000;
     this.interval = this.minInterval;
+    this.maxWait = CFG.SAVE_MAX_WAIT_MS || 60000;
+    this.unsavedSince = null;   // time of the oldest change the server has not confirmed yet
+    this.changedInFlight = null; // time of the first change made while a request was in flight
     this.seq = 0;
     this.savedSeq = 0;
     this.savedHash = null;
@@ -157,14 +162,33 @@
 
   Saver.prototype.isDirty = function () { return this.seq !== this.savedSeq; };
 
-  /** Something changed: save after the debounce delay (respecting the min interval). */
+  /** Remember when the oldest unsaved change happened (for the max-wait cap). */
+  Saver.prototype._noteChange = function () {
+    var t = Date.now();
+    if (this.unsavedSince === null) this.unsavedSince = t;
+    if (this.inFlight && this.changedInFlight === null) this.changedInFlight = t;
+  };
+
+  /**
+   * Delay until the next autosave: the debounce after the last change, but never later than
+   * maxWait after the oldest unsaved change (so continuous typing cannot postpone it forever),
+   * and never earlier than the min interval after the previous save (at most one per interval).
+   */
+  Saver.prototype._autoWait = function () {
+    var t = Date.now();
+    var at = t + this.debounce + Math.random() * 1000;
+    if (this.unsavedSince !== null) at = Math.min(at, this.unsavedSince + this.maxWait);
+    at = Math.max(at, this.lastSentAt + this.interval);
+    return at - t;
+  };
+
+  /** Something changed: autosave after the debounce delay (capped, respecting the min interval). */
   Saver.prototype.markDirty = function () {
     this.seq += 1;
+    this._noteChange();
     if (this.failures > 0) return; // retry timer already running
     this.opts.onStatus("pending");
-    var jitter = Math.random() * 1000;
-    var wait = Math.max(this.debounce + jitter, this.lastSentAt + this.interval - Date.now());
-    this._schedule(wait);
+    this._schedule(this._autoWait());
   };
 
   /**
@@ -174,6 +198,7 @@
    */
   Saver.prototype.saveNow = function () {
     this.seq += 1;
+    this._noteChange();
     this.force = true;
     this.urgent = true;
     this.failures = 0;
@@ -196,12 +221,14 @@
     var seqAtSend = this.seq;
     if (built.hash === this.savedHash && !this.force) {
       this.savedSeq = seqAtSend;
+      this.unsavedSince = null;
       this.opts.onStatus("saved", { time: this.lastSavedTime });
       return;
     }
     this.force = false;
     this.urgent = false;
     this.inFlight = true;
+    this.changedInFlight = null;
     this.lastSentAt = Date.now();
     this.opts.onStatus("saving");
     var t0 = Date.now();
@@ -217,17 +244,25 @@
         : latency > 4000 ? Math.max(self.minInterval, 40000) : self.minInterval;
       if (self.opts.onSaved) self.opts.onSaved(built.payload);
       if (self.isDirty()) {
+        // changes made during the flight are the oldest unsaved ones now
+        self.unsavedSince = self.changedInFlight !== null ? self.changedInFlight : Date.now();
         self.opts.onStatus("pending");
         // an urgent save requested during the flight goes out at once
-        self._schedule(self.urgent ? 0 : Math.max(self.debounce, self.interval - latency));
+        self._schedule(self.urgent ? 0 : self._autoWait());
       } else {
+        self.unsavedSince = null;
         self.opts.onStatus("saved", { time: self.lastSavedTime });
       }
     }, function (err) {
       self.inFlight = false;
       self.failures += 1;
+      var code = err && err.code;
       var delay = Math.min(60000, 5000 * Math.pow(2, self.failures - 1)) * (0.75 + Math.random() * 0.5);
-      self.opts.onStatus("error", { code: err && err.code, retryIn: delay, offline: navigator.onLine === false });
+      var offline = navigator.onLine === false;
+      // the server is only busy (lock wait / overload): keep showing "Mentés…" for the first
+      // two retries – the data is safe on the phone and the save goes through shortly
+      if (!offline && BUSY_CODES.test(code || "") && self.failures <= 2) self.opts.onStatus("pending", { code: code, retryIn: delay });
+      else self.opts.onStatus("error", { code: code, retryIn: delay, offline: offline });
       self._schedule(delay);
     });
   };

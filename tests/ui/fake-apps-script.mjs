@@ -10,7 +10,7 @@ export function startFakeAppsScript(port = 8092, opts = {}) {
   const results = new Map();
   // log.requests: one entry per POST {t, mode, contentType, action, rev, state, result}
   // log.delayNext: hold the NEXT request this many ms before doPost runs (simulates a slow network)
-  const log = { posts: 0, options: 0, contentTypes: new Set(), failing: false, actions: [], requests: [], delayNext: 0 };
+  const log = { posts: 0, options: 0, contentTypes: new Set(), failing: false, actions: [], requests: [], delayNext: 0, busyNext: 0 };
   let seq = 0;
   const cors = { "Access-Control-Allow-Origin": "*" };
 
@@ -37,7 +37,10 @@ export function startFakeAppsScript(port = 8092, opts = {}) {
         setTimeout(() => {
           if (log.failing) { entry.result = { failed: true }; res.writeHead(500, cors); res.end("error"); return; }
           let out;
-          try { out = gas.post(body); } catch (e) { out = { ok: false, error: "server_error", message: String(e) }; }
+          if (log.busyNext > 0 && parsed && parsed.action === "save") { log.busyNext--; out = { ok: false, error: "busy", t: { wait: 8000 } }; }
+          else {
+            try { out = gas.post(body); } catch (e) { out = { ok: false, error: "server_error", message: String(e) }; }
+          }
           entry.result = out;
           entry.done = Date.now();
           const id = String(++seq);

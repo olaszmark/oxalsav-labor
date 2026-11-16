@@ -44,8 +44,9 @@ function configScript(apiUrl, fast) {
     API_URL: ${JSON.stringify(apiUrl)},
     PRESET_VOLUMES: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20],
     TITLE: "Oxálsav konduktometriás titrálása",
-    SAVE_DEBOUNCE_MS: ${fast ? 600 : 5000},
-    SAVE_MIN_INTERVAL_MS: ${fast ? 1200 : 20000},
+    SAVE_DEBOUNCE_MS: ${fast ? 600 : 10000},
+    SAVE_MIN_INTERVAL_MS: ${fast ? 1200 : 60000},
+    SAVE_MAX_WAIT_MS: ${fast ? 5000 : 60000},
     REQUEST_TIMEOUT_MS: 8000 };`;
 }
 async function useConfig(ctx, apiUrl, fast = true) {
@@ -329,6 +330,31 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await page.waitForFunction(() => document.getElementById("submitState").classList.contains("ok"), null, { timeout: 8000 });
   });
 
+  await step("server only busy → 'Mentés…' (not 'Hiba') for the first 2 retries, then saved", async () => {
+    const statuses = new Set();
+    await page.exposeFunction("__statusSeen", (t) => statuses.add(t)).catch(() => {});
+    await page.evaluate(() => new MutationObserver(() => window.__statusSeen(document.getElementById("saveStatus").textContent))
+      .observe(document.getElementById("saveStatus"), { childList: true, characterData: true, subtree: true }));
+    fake.log.busyNext = 2;
+    await page.locator('input[data-f="i"]').nth(2).fill("24,9");
+    await page.click("#submitBtn");                 // immediate save → busy, busy, ok
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 30000 });
+    assert.ok(![...statuses].some((t) => t.startsWith("Hiba")), "never showed Hiba: " + [...statuses].join(" | "));
+    assert.ok([...statuses].includes("Mentés…"));
+    assert.equal(fake.log.busyNext, 0);
+  });
+
+  await step("server busy 3 times in a row → 'Hiba – újrapróbálás' from the 3rd failure, then saved", async () => {
+    fake.log.busyNext = 3;
+    await page.locator('input[data-f="i"]').nth(2).fill("25,1");
+    await page.click("#submitBtn");
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent === "Hiba – újrapróbálás", null, { timeout: 30000 });
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 45000 });
+    await page.locator('input[data-f="i"]').nth(2).fill("25,5");
+    await page.click("#submitBtn");
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 15000 });
+  });
+
   await step("server error → 'Hiba – újrapróbálás', then automatic retry succeeds", async () => {
     fake.log.failing = true;
     await page.locator('input[data-f="i"]').nth(1).fill("27,4");
@@ -361,12 +387,12 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
   await ctx.close();
 }
 
-console.log("\nStudent – save rate limiting with the production timing (5 s debounce, 20 s min interval)");
+console.log("\nStudent – save rate limiting with the production timing (10 s debounce, 60 s min interval)");
 {
   const ctx = await browser.newContext({ ...iPhone });
   await useConfig(ctx, fake.url, false);
   const page = await ctx.newPage();
-  await step("21 quick edits → 1 save after the debounce, next save not before 20 s", async () => {
+  await step("21 quick edits → 1 save after the debounce, next save not before 60 s", async () => {
     await page.goto(WEB + "/index.html");
     await page.fill("#nameInput", "Rate Teszt");
     await page.click("#startForm button");
@@ -376,16 +402,43 @@ console.log("\nStudent – save rate limiting with the production timing (5 s de
     const t0 = Date.now();
     for (let k = 0; k < ins.length; k++) { await ins[k].fill(String(current(k))); await sleep(100); }
     assert.equal(fake.log.posts - p0, 0, "nothing sent while typing");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 25000 });
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 75000 });
     const tFirst = Date.now();
     assert.equal(fake.log.posts - p0, 1, "exactly one save");
     await ins[0].fill("31");
-    await sleep(7000);
+    await sleep(15000);
     assert.equal(fake.log.posts - p0, 1, "still one save – min interval not yet over");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 25000 });
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 75000 });
     const gap = Date.now() - tFirst;
     assert.equal(fake.log.posts - p0, 2);
-    assert.ok(gap >= 15000, "second save after ≥ 20 s since the first was sent (gap " + gap + " ms, typing took " + (tFirst - t0) + " ms)");
+    assert.ok(gap >= 55000, "second save after ≥ 60 s since the first was sent (gap " + gap + " ms, typing took " + (tFirst - t0) + " ms)");
+  });
+  await ctx.close();
+}
+
+console.log("\nStudent – autosave cap: ≤ 60 s after the first unsaved change, even while typing (production timing)");
+{
+  const ctx = await browser.newContext({ ...iPhone });
+  await useConfig(ctx, fake.url, false);
+  const page = await ctx.newPage();
+  await step("typing every 4 s for 72 s (debounce never fires) → exactly one autosave ≈ 60 s after the first change", async () => {
+    await page.goto(WEB + "/index.html");
+    await page.fill("#nameInput", "Cap Teszt");
+    await page.click("#startForm button");
+    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"));
+    const capSaves = () => fake.log.requests.filter((r) => r.action === "save" && r.state && r.state.name === "Cap Teszt");
+    const n0 = capSaves().length;
+    const tFirst = Date.now();
+    for (let k = 0; k < 18; k++) {                  // 18 edits × 4 s = 72 s of continuous typing
+      await page.locator('input[data-f="i"]').nth(k).fill(String(current(k)));
+      await sleep(4000);
+    }
+    const autosaves = capSaves().slice(n0);
+    assert.equal(autosaves.length, 1, "exactly one autosave while typing (got " + autosaves.length + ")");
+    const after = autosaves[0].t - tFirst;
+    assert.ok(after >= 55000 && after <= 66000, "autosave " + after + " ms after the first change (expected ≈ 60 s)");
+    assert.ok(autosaves[0].state.rows.filter((r) => r.i !== "").length >= 14, "it carries the values typed so far");
+    console.log(`      (autosave ${(after / 1000).toFixed(1)} s after the first change, while still typing)`);
   });
   await ctx.close();
 }
@@ -484,7 +537,7 @@ console.log("\nTeacher page");
       await page.fill("#pwInput", "titok");
       await page.click("#loginBtn");
       await page.locator("#listBody tr").first().waitFor();
-      assert.equal(await page.locator("#listBody tr").count(), 6);
+      assert.equal(await page.locator("#listBody tr").count(), fake.gas.post({ action: "list", password: "titok" }).students.length);
     });
     await step(`teacher (${suffix}): sorting and search`, async () => {
       await page.click('th[data-sort="name"]'); // toggles to descending
@@ -519,7 +572,7 @@ console.log("\nTeacher page");
         const csv1 = bytes1.toString("utf8");
         assert.ok(csv1.includes(";1. EP dĨ/dV / (mA/cm³);"), "summary header uses dĨ/dV");
         assert.ok(csv1.startsWith("﻿Név;Eszköz;Utolsó mentés;Beküldve"), csv1.slice(0, 80));
-        assert.ok(csv1.split("\r\n").length === 7, "header + 6 students");
+        assert.equal(csv1.split("\r\n").length, fake.gas.post({ action: "list", password: "titok" }).students.length + 1, "header + one line per student");
         assert.match(csv1, /Kiss Anna;[a-z0-9]+;[\d-]+ [\d:]+;igen/);
         const [d2] = await Promise.all([page.waitForEvent("download"), page.click("#csvAllBtn")]);
         const bytes2 = await readFile(await d2.path());
@@ -561,7 +614,7 @@ async function setHidden(page, hidden) {
 const waitStatus = (page, prefix, timeout = 30000) =>
   page.waitForFunction((p) => document.getElementById("saveStatus").textContent.startsWith(p), prefix, { timeout });
 
-console.log("\nSave guarantees – production timing (5 s debounce, 20 s min interval), Chromium / Pixel 7");
+console.log("\nSave guarantees – production timing (10 s debounce, 60 s min interval), Chromium / Pixel 7");
 {
   const ctx = await browser.newContext({ ...pixel });
   await useConfig(ctx, fake.url, false);
@@ -578,11 +631,11 @@ console.log("\nSave guarantees – production timing (5 s debounce, 20 s min int
     await waitStatus(page, "Mentve");
     const ins = await page.$$('input[data-f="i"]');
     for (let k = 0; k < ins.length; k++) await ins[k].fill(String(current(k)));
-    await waitSaves(NAME, 2, 26000);                // ≥ 20 s after the registration save
+    await waitSaves(NAME, 2, 75000);                // ≥ 60 s after the registration save
     await waitStatus(page, "Mentve");
   });
 
-  await step("a) Beküldés right after an edit (inside the 20 s window) is saved at once", async () => {
+  await step("a) Beküldés right after an edit (inside the 60 s window) is saved at once", async () => {
     const n = savesOf(NAME).length;
     await inp(0).fill("31,1");
     await page.click("#submitBtn");
@@ -610,7 +663,7 @@ console.log("\nSave guarantees – production timing (5 s debounce, 20 s min int
     }
   });
 
-  await step("EP 'Törlés' inside the 20 s window is saved at once", async () => {
+  await step("EP 'Törlés' inside the 60 s window is saved at once", async () => {
     const n = savesOf(NAME).length;
     await page.click("#ep2Del");                    // confirm() is accepted by the dialog handler
     const dt = await waitSaves(NAME, n + 1, 2000);
@@ -631,7 +684,7 @@ console.log("\nSave guarantees – production timing (5 s debounce, 20 s min int
     const [a, b] = savesOf(NAME).slice(-2);
     await waitStatus(page, "Mentve");
     const gap = b.t - a.done;
-    assert.ok(gap < 1500, `delete sent ${gap} ms after the in-flight save finished (would be ~20 s throttled)`);
+    assert.ok(gap < 1500, `delete sent ${gap} ms after the in-flight save finished (would be ~60 s throttled)`);
     assert.equal(b.state.ep1, null);
     assert.equal(serverStudent(NAME).ep1v, null);
   });
@@ -648,7 +701,7 @@ console.log("\nSave guarantees – production timing (5 s debounce, 20 s min int
     const [a, b] = savesOf(NAME).slice(-2);
     await waitStatus(page, "Mentve");
     const gap = b.t - a.done;
-    assert.ok(gap < 1500, `second request ${gap} ms after the first finished (would be ~20 s throttled)`);
+    assert.ok(gap < 1500, `second request ${gap} ms after the first finished (would be ~60 s throttled)`);
     assert.equal(serverStudent(NAME).state.rows[2].i, "25,5");
   });
 
@@ -683,19 +736,21 @@ console.log("\nSave guarantees – production timing (5 s debounce, 20 s min int
     const [a, b] = savesOf(NAME).slice(-2);
     assert.ok(b.rev > a.rev);
     for (let k = 0; k < 80 && !a.result; k++) await sleep(50);
-    assert.equal(a.result.stale, true, "server reported the late request as stale");
-    const st = serverStudent(NAME).state;
+    assert.equal(a.result.ok, true, "the late, older save is stored in the log …");
+    assert.ok(a.done > b.done, "… after the newer one");
+    const st = serverStudent(NAME).state;                // … but the teacher sees the newest revision
+    assert.equal(serverStudent(NAME).rev, b.rev);
     assert.equal(st.rows[5].i, "23,3", "newest edit kept");
     assert.equal(st.rows[4].i, "22,2");
     await setHidden(page, false);
-    await waitStatus(page, "Mentve");
+    await waitStatus(page, "Mentve", 80000);        // next confirmed save may follow the 60 s interval
   });
 
   await step("d) connection back after a failed save → retried at once (no backoff wait)", async () => {
     await ctx.setOffline(true);
     await inp(6).fill("24,4");
-    // the normal throttle still applies here (up to 20 s since the last save)
-    await page.waitForFunction(() => /Nincs internet|Hiba/.test(document.getElementById("saveStatus").textContent), null, { timeout: 30000 });
+    // the normal throttle still applies here (up to 60 s since the last save)
+    await page.waitForFunction(() => /Nincs internet|Hiba/.test(document.getElementById("saveStatus").textContent), null, { timeout: 80000 });
     assert.equal(await page.locator("#saveStatus").innerText(), "Nincs internet – újrapróbálás");
     const n = savesOf(NAME).length;
     await ctx.setOffline(false);
@@ -740,7 +795,7 @@ console.log("\nSave guarantees – WebKit (Safari engine) with iPhone 13 emulati
       assert.equal(serverStudent(NAME).state.rows[0].i, "30,3");
       await setHidden(page, false);
     });
-    await step("WebKit: Beküldés inside the 20 s window → saved at once", async () => {
+    await step("WebKit: Beküldés inside the 60 s window → saved at once", async () => {
       page.on("dialog", (d) => d.accept());
       const n = savesOf(NAME).length;
       await inp(1).fill("28,8");
