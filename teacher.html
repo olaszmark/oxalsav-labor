@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#283593">
+  <title>Oxálsav titrálás – tanári felület</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M12 3h8v2h-1v8l7 13a2 2 0 0 1-2 3H8a2 2 0 0 1-2-3l7-13V5h-1z' fill='%23283593'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css?v=2026.11.16-1">
+</head>
+<body class="teacher">
+
+  <!-- ===================== LOGIN ===================== -->
+  <section id="loginScreen" class="start" hidden>
+    <div class="start-card">
+      <h1>Tanári felület</h1>
+      <p class="muted" id="loginSub">Oxálsav konduktometriás titrálása</p>
+      <form id="loginForm" autocomplete="off">
+        <label for="pwInput">Jelszó</label>
+        <input id="pwInput" type="password" autocomplete="current-password" enterkeyhint="go" required>
+        <p id="loginError" class="login-error" hidden></p>
+        <button type="submit" class="btn primary block" id="loginBtn">Belépés</button>
+      </form>
+      <p id="mockNoteLogin" class="mock-note" hidden>TESZT MÓD – jelszó: <b>tanar</b></p>
+    </div>
+  </section>
+
+  <!-- ===================== APP ===================== -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="topbar-title">
+        <strong>Tanári felület</strong>
+        <span class="name-chip" id="topSub">Oxálsav titrálás</span>
+      </div>
+      <span id="loadStatus" class="save-status" role="status" aria-live="polite">–</span>
+    </header>
+    <p id="mockNote" class="mock-note" hidden>TESZT MÓD – a böngésző saját (helyi) adatai látszanak.</p>
+
+    <!-- ---------- list ---------- -->
+    <main class="layout" id="listView">
+      <section class="card">
+        <div class="teacher-bar">
+          <input type="search" id="searchInput" placeholder="Keresés név szerint…" aria-label="Keresés név szerint">
+          <button type="button" class="btn primary" id="refreshBtn">↻ Frissítés</button>
+          <label class="auto-label"><input type="checkbox" id="autoRefresh"> automatikus (30 s)</label>
+        </div>
+        <div class="teacher-bar" style="margin-top:8px">
+          <button type="button" class="btn small" id="csvSummaryBtn">CSV – összesítő</button>
+          <button type="button" class="btn small" id="csvAllBtn">CSV – összes mérési adat</button>
+          <span style="flex:1"></span>
+          <button type="button" class="link-btn" id="logoutBtn">Kilépés</button>
+        </div>
+        <p class="stats" id="stats"></p>
+        <div class="table-wrap">
+          <table class="list-table" id="listTable">
+            <thead>
+              <tr>
+                <th data-sort="name">Név <span class="arrow"></span></th>
+                <th data-sort="savedAt">Utolsó mentés <span class="arrow"></span></th>
+                <th data-sort="submitted">Beküldve <span class="arrow"></span></th>
+                <th data-sort="ep1v">1. EP / cm³ <span class="arrow"></span></th>
+                <th data-sort="ep2v">2. EP / cm³ <span class="arrow"></span></th>
+                <th data-sort="points">Pontok <span class="arrow"></span></th>
+              </tr>
+            </thead>
+            <tbody id="listBody"></tbody>
+          </table>
+        </div>
+        <p class="muted small" id="emptyNote" hidden>Még nincs beérkezett adat.</p>
+      </section>
+    </main>
+
+    <!-- ---------- detail (read-only) ---------- -->
+    <main class="layout" id="detailView" hidden>
+      <section class="card">
+        <div class="detail-head">
+          <button type="button" class="btn small" id="backBtn">← Vissza a listához</button>
+          <h2 id="dName" style="margin:0"></h2>
+          <span id="dSubmitted"></span>
+        </div>
+        <div class="detail-meta" id="dMeta"></div>
+      </section>
+      <div class="detail-grid">
+        <section class="card">
+          <h2>Mérési adatok</h2>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th class="col-n">#</th>
+                  <th>V(NaOH) / cm³</th>
+                  <th>Ĩ / mA</th>
+                  <th class="col-d">dĨ/dV /<br>(mA/cm³)</th>
+                </tr>
+              </thead>
+              <tbody id="dBody"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="card plot-card">
+          <h2>Grafikon</h2>
+          <div class="plot-box"><canvas id="dPlot"></canvas>
+            <button type="button" class="zoom-reset" id="dResetZoom" hidden>⟲ Teljes nézet</button></div>
+          <div class="readout" id="dReadout">Kattints / érintsd meg a grafikont az értékek leolvasásához.</div>
+          <div class="plot-controls">
+            <label class="switch">
+              <input type="checkbox" id="dDerivToggle" checked>
+              <span class="switch-ui" aria-hidden="true"></span>
+              Derivált megjelenítése
+            </label>
+          </div>
+          <div class="results">
+            <h3>A tanuló által kijelölt ekvivalenciapontok</h3>
+            <div class="result-row"><span class="ep-badge ep1">1. EP</span><span class="result-val" id="dEp1"></span></div>
+            <div class="result-row" style="margin-top:6px"><span class="ep-badge ep2">2. EP</span><span class="result-val" id="dEp2"></span></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="js/config.js?v=2026.11.16-1"></script>
+  <script src="js/core.js?v=2026.11.16-1"></script>
+  <script src="js/api.js?v=2026.11.16-1"></script>
+  <script src="js/plot.js?v=2026.11.16-1"></script>
+  <script src="js/teacher.js?v=2026.11.16-1"></script>
+</body>
+</html>

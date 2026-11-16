@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#283593">
+  <meta name="format-detection" content="telephone=no">
+  <title>Oxálsav titrálás – tanulói felület</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M12 3h8v2h-1v8l7 13a2 2 0 0 1-2 3H8a2 2 0 0 1-2-3l7-13V5h-1z' fill='%23283593'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css?v=2026.11.16-1">
+</head>
+<body class="student">
+
+  <!-- ===================== START SCREEN ===================== -->
+  <section id="startScreen" class="start" hidden>
+    <div class="start-card">
+      <h1 id="appTitle">Oxálsav konduktometriás titrálása</h1>
+      <p class="muted">Add meg a neved, majd töltsd ki a mérési táblázatot.</p>
+      <form id="startForm" autocomplete="off" novalidate>
+        <label for="nameInput">Név</label>
+        <input id="nameInput" name="name" type="text" maxlength="80" autocomplete="name"
+               autocapitalize="words" enterkeyhint="go" placeholder="pl. Kiss Anna" required>
+        <p id="nameError" class="field-error" hidden>Kérlek, add meg a teljes neved.</p>
+        <button type="submit" class="btn primary block">Kezdés</button>
+      </form>
+      <p id="mockNoteStart" class="mock-note" hidden>TESZT MÓD – az adatok csak ezen az eszközön tárolódnak.</p>
+    </div>
+  </section>
+
+  <!-- ===================== MAIN APP ===================== -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="topbar-title">
+        <strong id="topTitle">Oxálsav titrálás</strong>
+        <span id="studentName" class="name-chip"></span>
+      </div>
+      <span id="saveStatus" class="save-status" role="status" aria-live="polite">–</span>
+    </header>
+    <p id="mockNote" class="mock-note" hidden>TESZT MÓD – nincs szerver, az adatok csak ezen az eszközön tárolódnak.</p>
+
+    <main class="layout">
+      <!-- ---------- 1. data table ---------- -->
+      <section class="card" id="dataCard">
+        <h2><span class="step">1</span> Mérési adatok</h2>
+        <p class="muted small">Írd be a mért áramerősségeket. Tizedesvessző és tizedespont is jó.</p>
+        <div class="table-wrap">
+          <table class="data-table" id="dataTable">
+            <thead>
+              <tr>
+                <th class="col-n">#</th>
+                <th>V(NaOH) / cm³</th>
+                <th>Ĩ / mA</th>
+                <th class="col-d">dĨ/dV /<br>(mA/cm³)</th>
+                <th class="col-x"><span class="sr-only">Törlés</span></th>
+              </tr>
+            </thead>
+            <tbody id="dataBody"></tbody>
+          </table>
+        </div>
+        <div class="row-actions">
+          <button type="button" class="btn" id="addRowBtn">+ Új sor</button>
+          <span id="pointCount" class="muted small"></span>
+        </div>
+        <div id="sortHint" class="hint warn" hidden>
+          A térfogatok nem növekvő sorrendben vannak.
+          <button type="button" class="btn small" id="sortBtn">Sorba rendezés</button>
+        </div>
+      </section>
+
+      <!-- ---------- 2. plot + equivalence points ---------- -->
+      <section class="card plot-card" id="plotCard">
+        <h2><span class="step">2</span> Grafikon és ekvivalenciapontok</h2>
+        <div class="plot-box" id="plotBox">
+          <canvas id="plot" aria-label="Titrálási görbe: áramerősség és derivált a NaOH térfogat függvényében"></canvas>
+          <button type="button" class="zoom-reset" id="resetZoomBtn" hidden>⟲ Teljes nézet</button>
+        </div>
+        <div class="readout" id="readout">Érintsd meg a grafikont az értékek leolvasásához.</div>
+        <div class="plot-controls">
+          <label class="switch">
+            <input type="checkbox" id="derivToggle" checked>
+            <span class="switch-ui" aria-hidden="true"></span>
+            Derivált megjelenítése
+          </label>
+        </div>
+        <p class="muted small gesture-hint">☝ Egy ujj: kurzor &nbsp;·&nbsp; ✌ Két ujj: nagyítás, mozgatás</p>
+
+        <div class="ep-buttons" id="epButtons">
+          <button type="button" class="btn ep1" id="ep1Btn">1. ekvivalenciapont kijelölése</button>
+          <button type="button" class="btn ep2" id="ep2Btn">2. ekvivalenciapont kijelölése</button>
+        </div>
+        <div class="ep-select" id="epSelect" hidden>
+          <p id="epSelectText"></p>
+          <strong class="ep-select-short" id="epSelectShort"></strong>
+          <div class="ep-select-actions">
+            <button type="button" class="btn primary" id="epSaveBtn" disabled>Mentés</button>
+            <button type="button" class="btn" id="epCancelBtn">Mégse</button>
+          </div>
+        </div>
+
+        <div class="results" id="results">
+          <h3>Eredmények</h3>
+          <div class="result-row" data-ep="1">
+            <span class="ep-badge ep1">1. EP</span>
+            <span class="result-val" id="ep1Val">még nincs kijelölve</span>
+            <button type="button" class="link-btn" id="ep1Del" hidden>Törlés</button>
+          </div>
+          <p class="muted small ep-help">Az 1. ekvivalenciapont ott van, ahol a derivált értéke 0.</p>
+          <div class="result-row" data-ep="2">
+            <span class="ep-badge ep2">2. EP</span>
+            <span class="result-val" id="ep2Val">még nincs kijelölve</span>
+            <button type="button" class="link-btn" id="ep2Del" hidden>Törlés</button>
+          </div>
+          <p class="muted small ep-help">A 2. ekvivalenciapont a derivált maximumánál van.</p>
+        </div>
+      </section>
+
+      <!-- ---------- 3. submit ---------- -->
+      <section class="card" id="submitCard">
+        <h2><span class="step">3</span> Beküldés</h2>
+        <p id="submitState" class="submit-state">Még nem küldted be.</p>
+        <button type="button" class="btn primary block big" id="submitBtn">Beküldés</button>
+        <p class="muted small">A munkád beküldés után is szerkeszthető és újra beküldhető – mindig a legutolsó változat számít.
+          Az adatok közben automatikusan mentődnek.</p>
+      </section>
+
+      <footer class="foot muted small">
+        <span id="deviceInfo"></span>
+        <button type="button" class="link-btn" id="switchUserBtn">Másik tanuló ezen a telefonon</button>
+      </footer>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+    <span id="toastText"></span>
+    <button type="button" class="link-btn" id="toastAction" hidden></button>
+  </div>
+
+  <noscript>Az alkalmazás működéséhez engedélyezni kell a JavaScriptet.</noscript>
+
+  <script src="js/config.js?v=2026.11.16-1"></script>
+  <script src="js/core.js?v=2026.11.16-1"></script>
+  <script src="js/api.js?v=2026.11.16-1"></script>
+  <script src="js/plot.js?v=2026.11.16-1"></script>
+  <script src="js/student.js?v=2026.11.16-1"></script>
+</body>
+</html>
