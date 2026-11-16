@@ -115,6 +115,9 @@ async function plotPos(page, v, y, axis = "R") {
   }, [v, y, axis]);
 }
 const readout = (page) => page.locator("#readout").innerText();
+// "Mentve" = server confirmed ("Mentve hh:mm"), not the grey "Mentve a telefonon"
+const waitStatus = (page, prefix, timeout = 30000) =>
+  page.waitForFunction((p) => { const t = document.getElementById("saveStatus").textContent; return p === "Mentve" ? /^Mentve \d\d:\d\d$/.test(t) : t.startsWith(p); }, prefix, { timeout });
 const readoutV = async (page) => {
   const m = (await readout(page)).match(/V = ([\d,]+)/);
   return m ? Number(m[1].replace(",", ".")) : null;
@@ -152,7 +155,7 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await page.click("#startForm button");
     await page.locator("#app").waitFor();
     assert.equal(await page.locator("#studentName").innerText(), "Kiss Anna");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"));
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent));
     const list = fake.gas.post({ action: "list", password: "titok" });
     assert.equal(list.students.length, 1);
     assert.equal(list.students[0].name, "Kiss Anna");
@@ -321,16 +324,16 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
   await step("editing after submit → 'küldd be újra' + server flag", async () => {
     await page.locator('input[data-f="i"]').nth(0).fill("30,5");
     assert.match(await page.locator("#submitState").innerText(), /Küldd be újra/);
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 8000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 8000 });
     await sleep(1500);
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 8000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 8000 });
     const s = fake.gas.post({ action: "list", password: "titok" }).students[0];
     assert.equal(s.changedAfterSubmit, true);
     await page.click("#submitBtn");
     await page.waitForFunction(() => document.getElementById("submitState").classList.contains("ok"), null, { timeout: 8000 });
   });
 
-  await step("server only busy → 'Mentés…' (not 'Hiba') for the first 2 retries, then saved", async () => {
+  await step("server only busy → 'Küldés…' (not 'Hiba') for the first 2 retries, then saved", async () => {
     const statuses = new Set();
     await page.exposeFunction("__statusSeen", (t) => statuses.add(t)).catch(() => {});
     await page.evaluate(() => new MutationObserver(() => window.__statusSeen(document.getElementById("saveStatus").textContent))
@@ -338,9 +341,9 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     fake.log.busyNext = 2;
     await page.locator('input[data-f="i"]').nth(2).fill("24,9");
     await page.click("#submitBtn");                 // immediate save → busy, busy, ok
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 30000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 30000 });
     assert.ok(![...statuses].some((t) => t.startsWith("Hiba")), "never showed Hiba: " + [...statuses].join(" | "));
-    assert.ok([...statuses].includes("Mentés…"));
+    assert.ok([...statuses].includes("Küldés…"));
     assert.equal(fake.log.busyNext, 0);
   });
 
@@ -349,10 +352,10 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await page.locator('input[data-f="i"]').nth(2).fill("25,1");
     await page.click("#submitBtn");
     await page.waitForFunction(() => document.getElementById("saveStatus").textContent === "Hiba – újrapróbálás", null, { timeout: 30000 });
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 45000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 45000 });
     await page.locator('input[data-f="i"]').nth(2).fill("25,5");
     await page.click("#submitBtn");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 15000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 15000 });
   });
 
   await step("server error → 'Hiba – újrapróbálás', then automatic retry succeeds", async () => {
@@ -363,7 +366,7 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await page.evaluate(() => window.scrollTo(0, 0));
     await shot(page, "12_save_error_retry");
     fake.log.failing = false;
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 15000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 15000 });
     const st = fake.gas.post({ action: "get", password: "titok", key: fake.gas.post({ action: "list", password: "titok" }).students[0].key }).student.state;
     assert.equal(st.rows[1].i, "27,4");
   });
@@ -396,19 +399,19 @@ console.log("\nStudent – save rate limiting with the production timing (10 s d
     await page.goto(WEB + "/index.html");
     await page.fill("#nameInput", "Rate Teszt");
     await page.click("#startForm button");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"));
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent));
     const p0 = fake.log.posts;
     const ins = await page.$$('input[data-f="i"]');
     const t0 = Date.now();
     for (let k = 0; k < ins.length; k++) { await ins[k].fill(String(current(k))); await sleep(100); }
     assert.equal(fake.log.posts - p0, 0, "nothing sent while typing");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 75000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 75000 });
     const tFirst = Date.now();
     assert.equal(fake.log.posts - p0, 1, "exactly one save");
     await ins[0].fill("31");
     await sleep(15000);
     assert.equal(fake.log.posts - p0, 1, "still one save – min interval not yet over");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"), null, { timeout: 75000 });
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 75000 });
     const gap = Date.now() - tFirst;
     assert.equal(fake.log.posts - p0, 2);
     assert.ok(gap >= 55000, "second save after ≥ 60 s since the first was sent (gap " + gap + " ms, typing took " + (tFirst - t0) + " ms)");
@@ -425,7 +428,7 @@ console.log("\nStudent – autosave cap: ≤ 60 s after the first unsaved change
     await page.goto(WEB + "/index.html");
     await page.fill("#nameInput", "Cap Teszt");
     await page.click("#startForm button");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"));
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent));
     const capSaves = () => fake.log.requests.filter((r) => r.action === "save" && r.state && r.state.name === "Cap Teszt");
     const n0 = capSaves().length;
     const tFirst = Date.now();
@@ -441,6 +444,96 @@ console.log("\nStudent – autosave cap: ≤ 60 s after the first unsaved change
     console.log(`      (autosave ${(after / 1000).toFixed(1)} s after the first change, while still typing)`);
   });
   await ctx.close();
+}
+
+console.log("\nStatus chip – every state on an iPhone SE (375×667), portrait and landscape");
+{
+  const contrast = (fg, bg) => {
+    const lum = (c) => { const [r, g, b] = c.match(/\d+/g).slice(0, 3).map(Number).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+    const [a, b] = [lum(fg), lum(bg)].sort((x, y) => y - x);
+    return (a + 0.05) / (b + 0.05);
+  };
+  for (const [dev, orient] of [
+    [{ ...devices["iPhone 8"], viewport: { width: 375, height: 667 } }, "portrait"],
+    [{ ...devices["iPhone 8 landscape"], viewport: { width: 667, height: 375 } }, "landscape"]
+  ]) {
+    const ctx = await browser.newContext({ ...dev });
+    await useConfig(ctx, fake.url, false);           // production timing: 10 s debounce, 60 s interval
+    const page = await ctx.newPage();
+    page.on("dialog", (d) => d.accept());
+    const NAME = "Szentgyörgyi-Nagy Krisztina";      // a long name: the title must give way, not the chip
+    const inp = (k) => page.locator('input[data-f="i"]').nth(k);
+    let topH = null;
+    const check = async (label, text, cls, minContrast) => {
+      const g = await page.evaluate(() => {
+        const chip = document.getElementById("saveStatus"), title = document.querySelector(".topbar-title"), bar = document.querySelector(".topbar");
+        const c = chip.getBoundingClientRect(), t = title.getBoundingClientRect(), b = bar.getBoundingClientRect();
+        const cs = getComputedStyle(chip);
+        return { text: chip.textContent, cls: chip.className, cH: c.height, cL: c.left, cR: c.right, tR: t.right, bH: b.height, vw: window.innerWidth,
+          over: chip.scrollWidth - chip.clientWidth, lh: parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.4, fg: cs.color, bg: cs.backgroundColor };
+      });
+      if (text instanceof RegExp) assert.match(g.text, text, label); else assert.equal(g.text, text, label);
+      assert.ok(g.cls.split(" ").includes(cls), label + ": class " + g.cls);
+      assert.ok(g.cH < g.lh * 1.6 + 12, `${label}: chip wraps (height ${g.cH})`);
+      assert.ok(g.over <= 1, `${label}: text overflows the chip by ${g.over}px`);
+      assert.ok(g.cR <= g.vw + 0.5, `${label}: chip leaves the screen`);
+      assert.ok(g.tR <= g.cL + 0.5, `${label}: title overlaps the chip`);
+      if (topH === null) topH = g.bH; else assert.ok(Math.abs(g.bH - topH) < 1, `${label}: top bar height changed ${topH} → ${g.bH}`);
+      const cr = contrast(g.fg, g.bg);
+      assert.ok(cr >= minContrast, `${label}: contrast ${cr.toFixed(1)} < ${minContrast}`);
+      const bar = await page.locator(".topbar").boundingBox();
+      await page.screenshot({ path: join(SHOTS, `chip_${orient}_${label}.png`), clip: { x: 0, y: 0, width: bar.width, height: bar.height } });
+      return cr;
+    };
+    const ratios = {};
+    await step(`chip (${orient}): all states fit on one line, no overlap, readable`, async () => {
+      await page.goto(WEB + "/index.html");
+      await page.fill("#nameInput", NAME);
+      await page.click("#startForm button");
+      await waitStatus(page, "Mentve");
+      ratios.saved = await check("4_confirmed", /^Mentve \d\d:\d\d$/, "saved", 4.5);
+      // 1) waiting for the next autosave: data is on the phone
+      await inp(0).fill("17,27");
+      ratios.local = await check("1_waiting", "Mentve a telefonon", "local", 7);
+      // 2) actually sending (the server holds the request 4 s)
+      fake.log.delayNext = 4000;
+      await page.click("#submitBtn");
+      await page.waitForFunction(() => document.getElementById("saveStatus").textContent === "Küldés…");
+      ratios.sending = await check("2_sending", "Küldés…", "sending", 7);
+      await waitStatus(page, "Mentve");
+      // 3) the server is only busy → still "Küldés…" while the app waits to retry
+      fake.log.busyNext = 1;
+      await inp(1).fill("17,28");
+      await page.click("#submitBtn");
+      for (let k = 0; k < 100 && fake.log.busyNext > 0; k++) await sleep(50);
+      await sleep(400);
+      await check("3_busy_retry", "Küldés…", "sending", 7);
+      await waitStatus(page, "Mentve");
+      // 5) server error
+      fake.log.failing = true;
+      await inp(2).fill("17,27");
+      await page.click("#submitBtn");
+      await waitStatus(page, "Hiba");
+      ratios.error = await check("5_error", "Hiba – újrapróbálás", "error", 4.5);
+      fake.log.failing = false;
+      await waitStatus(page, "Mentve", 30000);
+      // 6) offline
+      await ctx.setOffline(true);
+      await inp(3).fill("17,25");
+      await page.click("#submitBtn");
+      await waitStatus(page, "Nincs internet");
+      await check("6_offline", "Nincs internet – újrapróbálás", "error", 4.5);
+      await ctx.setOffline(false);
+      await waitStatus(page, "Mentve", 30000);
+      // 7) the phone cannot store the data → never claim "Mentve a telefonon"
+      await page.evaluate(() => { window.__origSet = Storage.prototype.setItem; Storage.prototype.setItem = function () { throw new Error("QuotaExceededError"); }; });
+      await inp(4).fill("17,22");
+      await check("7_storage", "Hiba – a telefon tárhelye megtelt", "error", 4.5);
+      await page.evaluate(() => { Storage.prototype.setItem = window.__origSet; });
+      console.log(`      (contrast: waiting ${ratios.local.toFixed(1)}:1, sending ${ratios.sending.toFixed(1)}:1, confirmed ${ratios.saved.toFixed(1)}:1, error ${ratios.error.toFixed(1)}:1)`);
+    });
+    await ctx.close();
+  }
 }
 
 console.log("\nStudent – landscape + Android");
@@ -496,7 +589,7 @@ console.log("\nStudent – mock mode (no server)");
     assert.equal(await page.locator("#mockNoteStart").isVisible(), true);
     await page.fill("#nameInput", "Mock Mária");
     await page.click("#startForm button");
-    await page.waitForFunction(() => document.getElementById("saveStatus").textContent.startsWith("Mentve"));
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent));
     const db = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_mock_db")));
     assert.equal(Object.values(db)[0].name, "Mock Mária");
   });
@@ -611,8 +704,6 @@ async function setHidden(page, hidden) {
     document.dispatchEvent(new Event("visibilitychange"));
   }, hidden);
 }
-const waitStatus = (page, prefix, timeout = 30000) =>
-  page.waitForFunction((p) => document.getElementById("saveStatus").textContent.startsWith(p), prefix, { timeout });
 
 console.log("\nSave guarantees – production timing (10 s debounce, 60 s min interval), Chromium / Pixel 7");
 {

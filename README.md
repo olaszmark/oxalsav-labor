@@ -185,7 +185,9 @@ Print the QR code large enough (at least 6 cm) or project it, and add the URL in
 > 4. A grafikonon **egy ujjal** mozgathatod a kurzort, **két ujjal** nagyíthatsz. Görgetni a grafikon fölött vagy alatt tudsz.
 > 5. **1. ekvivalenciapont kijelölése** → keresd meg, ahol a derivált = 0 → **Mentés**.
 >    **2. ekvivalenciapont kijelölése** → keresd meg a derivált maximumát → **Mentés**.
-> 6. Végül nyomd meg a **Beküldés** gombot. A jobb felső sarokban a „Mentve” feliratnak kell látszania.
+> 6. Végül nyomd meg a **Beküldés** gombot. A jobb felső sarokban a zöld „Mentve óó:pp” feliratnak kell látszania.
+> 7. A jobb felső sarokban: szürke **„Mentve a telefonon”** = az adataid biztonságban vannak a telefonon, és automatikusan elküldjük őket; zöld **„Mentve óó:pp”** = megérkeztek a tanárhoz.
+>    Piros felirat = probléma van, de semmi sem veszett el, az alkalmazás tovább próbálkozik – ha sokáig piros marad, szólj a tanárnak.
 
 ---
 
@@ -199,7 +201,9 @@ If a student switches phones, the new phone creates a new row. The old row stays
 * Every change is written to **localStorage immediately**, so a reload or a closed tab restores everything.
 * A server autosave happens **10 s after the last change** (each change restarts this wait). There is never more than one request in flight per student, and at most one autosave **every 60 s** per student.
 * Unchanged data is not re-sent. On failure the app retries with exponential backoff (5 s → 60 s, with jitter).
-  If the server only answers **busy** (or times out / is overloaded), the phone keeps showing **"Mentés…"** for the first two retries; from the third failure, or for any other error, it shows **"Hiba – újrapróbálás"**.
+  The status chip (top right): grey **"Mentve a telefonon"** while the data is on the phone and the next autosave is scheduled, grey **"Küldés…"** while a save is being sent,
+  green **"Mentve hh:mm"** when the server confirmed it, red **"Hiba – újrapróbálás"** / **"Nincs internet – újrapróbálás"** on errors.
+  If the server only answers **busy** (or times out / is overloaded), the phone keeps showing **"Küldés…"** for the first two retries; from the third failure, or for any other error, it shows **"Hiba – újrapróbálás"**.
 * **Immediate saves** that bypass the 10 s / 60 s throttle:
   * **Beküldés**, and **Mentés** or **Törlés** of an equivalence point. If another save is still on its way, the new one goes out right after it.
   * **The page becoming hidden or closed:** tab closed, app switch, screen lock, or the tab switcher (`visibilitychange → hidden` and `pagehide`).

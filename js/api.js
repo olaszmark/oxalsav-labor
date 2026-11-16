@@ -9,7 +9,7 @@
   var MOCK_DELAY = parseInt(params.get("delay") || "600", 10);     // ms
   var MOCK_DB = "oxalsav_mock_db";
   var MOCK_PASSWORD = "tanar";
-  // errors that only mean "the server is busy right now" (shown as "Mentés…" for the first retries)
+  // errors that only mean "the server is busy right now" (shown as "Küldés…" for the first retries)
   var BUSY_CODES = /^(busy|timeout|http_429|http_503)$/;
 
   /* -------------------------------------------------------- transport */
@@ -259,9 +259,9 @@
       var code = err && err.code;
       var delay = Math.min(60000, 5000 * Math.pow(2, self.failures - 1)) * (0.75 + Math.random() * 0.5);
       var offline = navigator.onLine === false;
-      // the server is only busy (lock wait / overload): keep showing "Mentés…" for the first
+      // the server is only busy (lock wait / overload): keep showing "Küldés…" for the first
       // two retries – the data is safe on the phone and the save goes through shortly
-      if (!offline && BUSY_CODES.test(code || "") && self.failures <= 2) self.opts.onStatus("pending", { code: code, retryIn: delay });
+      if (!offline && BUSY_CODES.test(code || "") && self.failures <= 2) self.opts.onStatus("saving", { code: code, retryIn: delay, retry: true });
       else self.opts.onStatus("error", { code: code, retryIn: delay, offline: offline });
       self._schedule(delay);
     });

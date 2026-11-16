@@ -98,7 +98,8 @@ h3 { font-size: 1rem; margin: 0 0 0.4rem; }
   background: rgba(255, 255, 255, 0.15); white-space: nowrap;
 }
 .save-status.saved { background: #c8e6c9; color: #1b5e20; }
-.save-status.saving, .save-status.pending { background: #fff3cd; color: #7a5600; }
+/* grey = calm: "Mentve a telefonon" (data on the phone) and "Küldés…" (sending); dark text on light grey, contrast ≈ 11:1 */
+.save-status.local, .save-status.sending { background: #eceff1; color: #263238; }
 .save-status.error { background: #ffcdd2; color: #b71c1c; }
 
 /* ------------------------------------------------------------ layout */

@@ -66,10 +66,11 @@
     } catch (e) { return null; }
   }
 
+  var localSaveFailed = false; // the last write to the phone's storage failed
+
   function persistLocal() {
-    if (!lsSet(LS_STATE, JSON.stringify(state))) {
-      setStatus("error", { code: "storage" });
-    }
+    localSaveFailed = !lsSet(LS_STATE, JSON.stringify(state));
+    if (localSaveFailed) setStatus("error", { code: "storage" });
   }
 
   /** Called after every change made by the student. */
@@ -162,11 +163,21 @@
     return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
   }
 
+  /**
+   * Status chip (top right):
+   *   pending → grey  "Mentve a telefonon"  data is on the phone, the next autosave is scheduled
+   *   saving  → grey  "Küldés…"             a request is on its way (or retrying while the server is only busy)
+   *   saved   → green "Mentve hh:mm"        the server confirmed the save
+   *   error   → red   "Hiba – …" / "Nincs internet – …"
+   */
   function setStatus(s, info) {
     var el = $("saveStatus");
-    el.className = "save-status " + s;
+    // never claim "saved on the phone" if writing to the phone's storage failed
+    if (s === "pending" && localSaveFailed) { s = "error"; info = { code: "storage" }; }
+    el.className = "save-status " + ({ pending: "local", saving: "sending", saved: "saved", error: "error" }[s] || "");
     if (s === "saved") el.textContent = "Mentve " + hhmm(info && info.time ? info.time : new Date());
-    else if (s === "saving" || s === "pending") el.textContent = "Mentés…";
+    else if (s === "saving") el.textContent = "Küldés…";
+    else if (s === "pending") el.textContent = "Mentve a telefonon";
     else if (s === "error") {
       el.textContent = info && info.code === "storage" ? "Hiba – a telefon tárhelye megtelt"
         : info && info.offline ? "Nincs internet – újrapróbálás" : "Hiba – újrapróbálás";
@@ -460,7 +471,7 @@
 
     $("switchUserBtn").addEventListener("click", function () {
       if (saver.isDirty()) {
-        window.alert("Még nem mentődött el minden a szerverre. Várd meg, amíg a felső sarokban a „Mentve” felirat megjelenik.");
+        window.alert("Még nem mentődött el minden a szerverre. Várd meg, amíg a felső sarokban a zöld „Mentve óó:pp” felirat megjelenik.");
         return;
       }
       if (!window.confirm("Új tanuló kezd ezen a telefonon? A(z) " + state.name +
