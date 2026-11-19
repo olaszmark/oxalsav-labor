@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#283593">
   <title>Oxálsav titrálás – tanári felület</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M12 3h8v2h-1v8l7 13a2 2 0 0 1-2 3H8a2 2 0 0 1-2-3l7-13V5h-1z' fill='%23283593'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="css/style.css?v=2026.11.16-1746">
+  <link rel="stylesheet" href="css/style.css?v=2026.11.19-1605">
 </head>
 <body class="teacher">
 
@@ -39,6 +39,19 @@
 
     <!-- ---------- list ---------- -->
     <main class="layout" id="listView">
+      <section class="card true-card" id="trueCard">
+        <h2>Valós érték – 2. ekvivalenciapont</h2>
+        <form id="trueForm" class="true-form" autocomplete="off" novalidate>
+          <label for="trueInput">A 2. ekvivalenciapont valós NaOH-térfogata (V<sub>valós</sub> / cm³)</label>
+          <div class="true-row">
+            <input id="trueInput" type="text" inputmode="decimal" enterkeyhint="done" placeholder="pl. 24,15" spellcheck="false">
+            <button type="submit" class="btn primary" id="trueSaveBtn">Mentés</button>
+          </div>
+          <p class="field-error" id="trueError" hidden></p>
+        </form>
+        <p class="true-current" id="trueCurrent">Jelenleg: még nincs megadva.</p>
+        <p class="muted small">Minden tanulóra ugyanez az érték vonatkozik. A tanulók a beküldés után csak a saját relatív hibájukat látják, a valós értéket nem.</p>
+      </section>
       <section class="card">
         <div class="teacher-bar">
           <input type="search" id="searchInput" placeholder="Keresés név szerint…" aria-label="Keresés név szerint">
@@ -61,6 +74,7 @@
                 <th data-sort="submitted">Beküldve <span class="arrow"></span></th>
                 <th data-sort="ep1v">1. EP / cm³ <span class="arrow"></span></th>
                 <th data-sort="ep2v">2. EP / cm³ <span class="arrow"></span></th>
+                <th data-sort="relErr">Rel. hiba / % <span class="arrow"></span></th>
                 <th data-sort="points">Pontok <span class="arrow"></span></th>
               </tr>
             </thead>
@@ -89,9 +103,9 @@
               <thead>
                 <tr>
                   <th class="col-n">#</th>
-                  <th>V(NaOH) / cm³</th>
+                  <th>V<sub>valós</sub> / cm³</th>
                   <th>Ĩ / mA</th>
-                  <th class="col-d">dĨ/dV /<br>(mA/cm³)</th>
+                  <th class="col-d">Meredekség</th>
                 </tr>
               </thead>
               <tbody id="dBody"></tbody>
@@ -107,7 +121,17 @@
             <label class="switch">
               <input type="checkbox" id="dDerivToggle" checked>
               <span class="switch-ui" aria-hidden="true"></span>
-              Derivált megjelenítése
+              Meredekség megjelenítése
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="dEp1Toggle" checked>
+              <span class="switch-ui" aria-hidden="true"></span>
+              1. EP megjelenítése
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="dEp2Toggle" checked>
+              <span class="switch-ui" aria-hidden="true"></span>
+              2. EP megjelenítése
             </label>
           </div>
           <div class="results">
@@ -120,10 +144,10 @@
     </main>
   </div>
 
-  <script src="js/config.js?v=2026.11.16-1746"></script>
-  <script src="js/core.js?v=2026.11.16-1746"></script>
-  <script src="js/api.js?v=2026.11.16-1746"></script>
-  <script src="js/plot.js?v=2026.11.16-1746"></script>
-  <script src="js/teacher.js?v=2026.11.16-1746"></script>
+  <script src="js/config.js?v=2026.11.19-1605"></script>
+  <script src="js/core.js?v=2026.11.19-1605"></script>
+  <script src="js/api.js?v=2026.11.19-1605"></script>
+  <script src="js/plot.js?v=2026.11.19-1605"></script>
+  <script src="js/teacher.js?v=2026.11.19-1605"></script>
 </body>
 </html>

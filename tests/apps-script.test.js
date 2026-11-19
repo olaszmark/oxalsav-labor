@@ -183,11 +183,14 @@ test("selfTest() helper passes and cleans up", () => {
   assert.equal(g.sheets.Adatok.getLastRow(), 1);
 });
 
-test("sheet headers use the Ĩ symbol", () => {
+test("sheet headers: Vvalós / cm3 and Meredekség (no unit), same column layout as before", () => {
   const g = loadGas();
   save(g, "Kiss Anna", "abcdef123456", 1);
   const h = g.sheets.Adatok.data[0];
-  assert.ok(h.includes("1. EP dĨ/dV / (mA/cm³)") && h.includes("2. EP dĨ/dV / (mA/cm³)"), h.join(" | "));
+  assert.deepEqual(h.slice(7, 11), ["1. EP Vvalós / cm3", "1. EP Meredekség", "2. EP Vvalós / cm3", "2. EP Meredekség"]);
+  assert.equal(h.length, 14);
+  assert.equal(h[12], "Rev");
+  assert.ok(!h.join("|").includes("dĨ") && !h.join("|").includes("V(NaOH)"));
 });
 
 test("real dataset: server counts 43 points; a lower revision arriving later is ignored at read time", () => {
@@ -220,15 +223,137 @@ test("refreshSummary writes one row per student (newest version) with the number
   save(g, "Kiss Anna", "device00000a", 2); // late, older
   assert.equal(g.sandbox.refreshSummary(), 2);
   const sum = g.sheets["Összesítő"].data;
-  assert.equal(sum[0][0], "Név");
-  assert.equal(sum[0][11], "Mentések száma");
+  assert.deepEqual(sum[0], ["Név", "Eszköz", "Utolsó mentés", "Beküldve", "Beküldés ideje", "1. EP Vvalós / cm3", "1. EP Meredekség",
+    "2. EP Vvalós / cm3", "2. EP Meredekség", "Relatív hiba (%)", "Mérési pontok", "Mentések száma"]);
   assert.equal(sum[1][0], "Kiss Anna"); // sorted by name
   assert.equal(sum[1][3], "igen");
-  assert.equal(sum[1][6], 8.1);
+  assert.equal(sum[1][5], 8.1);
+  assert.equal(sum[1][9], "", "no true value yet → empty relative error");
   assert.equal(sum[1][11], 3);
   assert.equal(sum[2][0], "Nagy Béla");
   assert.equal(g.sheets.Adatok.getLastRow(), 5, "Adatok untouched");
   save(g, "Tóth Dani", "device00000c", 1);
   assert.equal(g.sandbox.refreshSummary(), 3, "refresh rewrites the tab");
   assert.equal(g.sheets["Összesítő"].data.filter((r) => r[0]).length, 4);
+});
+
+/* ------------------------------------------------------------ submitting is final */
+
+const EP1 = { v: 12, d: 0, i: 16.9 };
+const sub = (v2, extra = {}) => Object.assign({ submitted: true, submittedAt: new Date().toISOString(), ep1: EP1, ep2: { v: v2, d: 0.12, i: 17.6 } }, extra);
+
+test("submit-once: the FIRST submitted version is final; later saves do not change what the teacher sees", () => {
+  const g = loadGas();
+  const key = "abcdef123456|Kiss Anna";
+  save(g, "Kiss Anna", "abcdef123456", 1);
+  save(g, "Kiss Anna", "abcdef123456", 2, { ep1: EP1 });
+  save(g, "Kiss Anna", "abcdef123456", 3, sub(24.0));               // the submission
+  save(g, "Kiss Anna", "abcdef123456", 3, sub(24.0));               // same revision again (beacon)
+  save(g, "Kiss Anna", "abcdef123456", 4, sub(25.5));               // a later "resubmit" (e.g. an old cached app)
+  save(g, "Kiss Anna", "abcdef123456", 5, { ep1: EP1, rows: [] });  // a later normal save
+  assert.equal(g.sheets.Adatok.getLastRow(), 7, "every save is still logged");
+  const l = list(g)[0];
+  assert.equal(l.submitted, true);
+  assert.equal(l.rev, 3);
+  assert.equal(l.ep2v, 24.0);
+  assert.equal(l.saves, 6);
+  const one = getOne(g, key);
+  assert.equal(one.state.ep2.v, 24.0);
+  assert.equal(one.state.rows.length, 3, "rows of the submitted version");
+  assert.equal(g.post({ action: "all", password: "titok" }).students[0].state.ep2.v, 24.0);
+  g.sandbox.refreshSummary();
+  assert.equal(g.sheets["Összesítő"].data[1][7], 24.0);
+});
+
+test("submit-once: a late-arriving older submitted revision is the first one (lowest Rev wins)", () => {
+  const g = loadGas();
+  save(g, "Kiss Anna", "abcdef123456", 9, sub(25.0));
+  save(g, "Kiss Anna", "abcdef123456", 8, sub(24.0)); // arrives late but was submitted first
+  assert.equal(list(g)[0].ep2v, 24.0);
+  assert.equal(list(g)[0].rev, 8);
+});
+
+test("submit-once: the write path is unchanged – one append under the lock, no reads inside it", () => {
+  const g = loadGas();
+  save(g, "Kiss Anna", "abcdef123456", 1, sub(24.0));
+  const sh = g.sheets.Adatok;
+  const reads0 = sh.stats.reads, locks0 = g.lockAcquisitions(), appends0 = sh.stats.appends;
+  const r = save(g, "Kiss Anna", "abcdef123456", 2, sub(26.0));
+  assert.equal(r.ok, true);
+  assert.equal(sh.stats.appends - appends0, 1);
+  assert.equal(g.lockAcquisitions() - locks0, 1);
+  assert.equal(sh.stats.reads - reads0, 0, "a save never reads the log");
+});
+
+/* ------------------------------------------------------------ true value + relative error */
+
+const setTrue = (g, value, password = "titok") => g.post({ action: "setTrue", password, value });
+const result = (g, key) => g.post({ action: "result", key });
+
+test("setTrue: needs the password, accepts a decimal comma, stores it in the Script properties, can be changed", () => {
+  const g = loadGas();
+  assert.equal(setTrue(g, "24,15", "rossz").error, "auth");
+  assert.equal(g.props.TRUE_VALUE_EP2, undefined);
+  const r = setTrue(g, "24,15");
+  assert.equal(r.ok, true);
+  assert.equal(r.trueValue, 24.15);
+  assert.equal(g.props.TRUE_VALUE_EP2, "24.15");
+  assert.equal(g.post({ action: "list", password: "titok" }).trueValue, 24.15);
+  assert.equal(setTrue(g, "23.9").trueValue, 23.9, "changing it");
+  assert.equal(g.post({ action: "list", password: "titok" }).trueValue, 23.9);
+  for (const bad of ["abc", "-3", "0", "1e9"]) assert.equal(setTrue(g, bad).error, "bad_value", bad);
+  assert.equal(setTrue(g, "").trueValue, null, "empty clears it");
+  assert.equal(g.post({ action: "list", password: "titok" }).trueValue, null);
+});
+
+test("relative error: |V2 − true| / true × 100, V2 as shown (2 decimals), 1 decimal, no sign", () => {
+  const g = loadGas();
+  save(g, "A", "device00000a", 1, sub(24.5));      // +2.083… % → 2.1
+  save(g, "B", "device00000b", 1, sub(23.0));      // −4.166… % → 4.2 (no sign)
+  save(g, "C", "device00000c", 1, sub(24.0137));   // shown 24.01 → 0.0 %
+  save(g, "D", "device00000d", 1, { ep1: EP1 });   // no 2nd EP → null
+  save(g, "E", "device00000e", 1, sub(24.006));    // shown 24.01 → 0.0 (not 0.025 → 0.0)
+  assert.ok(list(g).every((s) => s.relErr === null), "no true value yet");
+  setTrue(g, "24,00");
+  const by = Object.fromEntries(list(g).map((s) => [s.name, s.relErr]));
+  assert.deepEqual(by, { A: 2.1, B: 4.2, C: 0, D: null, E: 0 });
+  setTrue(g, "20");
+  assert.equal(list(g).find((s) => s.name === "A").relErr, 22.5, "changing the true value updates every student");
+  assert.equal(getOne(g, "device00000a|A").relErr, 22.5);
+  assert.equal(g.post({ action: "all", password: "titok" }).students.find((s) => s.name === "A").relErr, 22.5);
+  g.sandbox.refreshSummary();
+  const row = g.sheets["Összesítő"].data.find((r) => r[0] === "A");
+  assert.equal(row[9], 22.5);
+  const fmt = g.sheets["Összesítő"].formats.find((f) => f.col === 10);
+  assert.ok(fmt && fmt.format === "0.0" && fmt.row === 2, "Relatív hiba column shown with 1 decimal: " + JSON.stringify(fmt));
+});
+
+test("result (student): only the percentage, never the true value; pending until the true value is entered", () => {
+  const g = loadGas();
+  const key = "abcdef123456|Kiss Anna";
+  save(g, "Kiss Anna", "abcdef123456", 1, sub(24.5));
+  const sh = g.sheets.Adatok;
+  const reads0 = sh.stats.reads;
+  assert.deepEqual(result(g, key), { ok: true, ready: false, reason: "pending" });
+  assert.equal(sh.stats.reads, reads0, "pending answer does not read the Sheet");
+  setTrue(g, "24,00");
+  const r = result(g, key);
+  assert.deepEqual(r, { ok: true, ready: true, relErr: 2.1 });
+  assert.ok(!JSON.stringify(r).includes("24"), "the true value is not in the answer");
+  assert.equal(r.trueValue, undefined);
+  // later saves do not change the result
+  save(g, "Kiss Anna", "abcdef123456", 2, sub(24.0));
+  assert.equal(result(g, key).relErr, 2.1);
+});
+
+test("result (student): not submitted / unknown key / bad key / no lock", () => {
+  const g = loadGas();
+  setTrue(g, "24");
+  save(g, "Nagy Béla", "device00000b", 1, { ep1: EP1, ep2: { v: 24, d: 0.1, i: 1 } });
+  assert.equal(result(g, "device00000b|Nagy Béla").reason, "not_submitted");
+  assert.equal(result(g, "nope|Nobody").reason, "not_submitted");
+  assert.equal(result(g, "").error, "bad_request");
+  const before = g.lockAcquisitions();
+  result(g, "device00000b|Nagy Béla");
+  assert.equal(g.lockAcquisitions(), before, "result takes no lock");
 });

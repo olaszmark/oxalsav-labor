@@ -1,4 +1,4 @@
-/* Canvas plot: current (left, blue, scatter) + derivative (right, orange, line+points),
+/* Canvas plot: current (left, blue, scatter) + Meredekség = derivative (right, orange, line only),
  * snapping cursor (one finger / mouse), pinch zoom + pan (two fingers), wheel zoom (desktop).
  * Depends on LabCore (core.js). */
 (function () {
@@ -25,7 +25,8 @@
     this.ctx = canvas.getContext("2d");
     this.opts = opts || {};
     this.series = { current: [], deriv: [] };
-    this.showDeriv = true;
+    this.showDeriv = false;
+    this.showEp = { ep1: true, ep2: true }; // marker toggles ("1. EP / 2. EP megjelenítése")
     this.eps = { ep1: null, ep2: null };
     this.cursorX = null;
     this.win = { x0: 0, x1: 1, y0: 0, y1: 1 }; // visible fraction of the home ranges
@@ -44,6 +45,8 @@
   LabPlot.prototype.setData = function (d) {
     if (d.series) { this.series = d.series; this.home = C.autoRanges(d.series); }
     if (d.showDeriv !== undefined) this.showDeriv = !!d.showDeriv;
+    if (d.showEp1 !== undefined) this.showEp.ep1 = !!d.showEp1;
+    if (d.showEp2 !== undefined) this.showEp.ep2 = !!d.showEp2;
     if (d.ep1 !== undefined) this.eps.ep1 = d.ep1;
     if (d.ep2 !== undefined) this.eps.ep2 = d.ep2;
     if (this.cursorX !== null) this._snapCursor(this.cursorX, false);
@@ -216,10 +219,10 @@
     ctx.fillText("Ĩ / mA", 4, 16);
     if (showD) {
       ctx.fillStyle = COLORS.deriv; ctx.textAlign = "right";
-      ctx.fillText("dĨ/dV / (mA/cm³)", this.cssW - 4, 16);
+      ctx.fillText("Meredekség", this.cssW - 4, 16);
     }
-    ctx.fillStyle = COLORS.text; ctx.textAlign = "center";
-    ctx.fillText("V(NaOH) / cm³", L.left + L.w / 2, this.cssH - 5);
+    ctx.fillStyle = COLORS.text;
+    subscriptTitle(ctx, "V", "valós", " / cm³", L.left + L.w / 2, this.cssH - 5, fontSize + 1);
     ctx.font = fontSize + "px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
 
     // ---- data (clipped to the plot area)
@@ -241,16 +244,14 @@
         der.forEach(function (p, k) { if (k === 0) ctx.moveTo(X(p.x), YR(p.y)); else ctx.lineTo(X(p.x), YR(p.y)); });
         ctx.stroke();
       }
-      ctx.fillStyle = COLORS.deriv;
-      der.forEach(function (p) { dot(ctx, X(p.x), YR(p.y), 3.2); });
     }
 
     ctx.fillStyle = COLORS.current; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1;
     this.series.current.forEach(function (p) { dot(ctx, X(p.x), YL(p.y), 3.8, true); });
 
     // saved equivalence points
-    this._drawEp(this.eps.ep1, "1. EP", COLORS.ep1, "diamond");
-    this._drawEp(this.eps.ep2, "2. EP", COLORS.ep2, "triangle");
+    if (this.showEp.ep1) this._drawEp(this.eps.ep1, "1. EP", COLORS.ep1, "diamond");
+    if (this.showEp.ep2) this._drawEp(this.eps.ep2, "2. EP", COLORS.ep2, "triangle");
 
     // cursor
     var info = this.getCursorInfo();
@@ -276,6 +277,19 @@
       ctx.fillText("Írd be a mért adatokat a táblázatba", L.left + L.w / 2, L.top + L.h / 2);
     }
   };
+
+  /** Centred axis title with a subscript, e.g. V_valós / cm³ (bold, current fill style). */
+  function subscriptTitle(ctx, main, sub, rest, cx, y, size) {
+    var fam = "px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    var big = "600 " + size + fam, small = "600 " + Math.round(size * 0.78) + fam;
+    ctx.font = big; var w1 = ctx.measureText(main).width, w3 = ctx.measureText(rest).width;
+    ctx.font = small; var w2 = ctx.measureText(sub).width;
+    var x = cx - (w1 + w2 + w3) / 2;
+    ctx.textAlign = "left";
+    ctx.font = big; ctx.fillText(main, x, y - 3);
+    ctx.font = small; ctx.fillText(sub, x + w1, y);
+    ctx.font = big; ctx.fillText(rest, x + w1 + w2, y - 3);
+  }
 
   LabPlot.prototype._drawEp = function (ep, label, color, shape) {
     if (!ep || !isFinite(ep.v)) return;

@@ -8,6 +8,7 @@
   var MOCK_FAIL = parseFloat(params.get("fail") || "0") || 0;     // e.g. ?mock=1&fail=0.5
   var MOCK_DELAY = parseInt(params.get("delay") || "600", 10);     // ms
   var MOCK_DB = "oxalsav_mock_db";
+  var MOCK_TRUE = "oxalsav_mock_true"; // mock: true value of the 2nd equivalence point
   var MOCK_PASSWORD = "tanar";
   // errors that only mean "the server is busy right now" (shown as "Küldés…" for the first retries)
   var BUSY_CODES = /^(busy|timeout|http_429|http_503)$/;
@@ -60,6 +61,23 @@
     return s;
   }
   function epNum(ep, f) { return ep && typeof ep[f] === "number" ? ep[f] : null; }
+  function mockTrue() {
+    var v = NaN;
+    try { v = Number(localStorage.getItem(MOCK_TRUE)); } catch (e) { /* ignore */ }
+    return v > 0 ? v : null;
+  }
+  /** Same rule as Code.gs: V2 rounded to 2 decimals (as shown), result rounded to 1 decimal. */
+  function relErr(v2, tv) {
+    if (typeof v2 !== "number" || !isFinite(v2) || !tv) return null;
+    var shown = Number(v2.toFixed(2));
+    return Math.round(Math.abs(shown - tv) / tv * 1000 + 1e-9) / 10;
+  }
+  function withErr(rec, tv) {
+    var o = {};
+    Object.keys(rec).forEach(function (k) { o[k] = rec[k]; });
+    o.relErr = relErr(rec.ep2v, tv);
+    return o;
+  }
 
   function mockHandle(p) {
     var db = mockLoad();
@@ -67,6 +85,7 @@
       case "save": {
         if (!p.key || !p.state) throw apiError("bad_request");
         var old = db[p.key];
+        if (old && old.submitted) return { ok: true, savedAt: new Date().toISOString() }; // submitting is final
         if (old && typeof old.rev === "number" && p.rev < old.rev) return { ok: true, stale: true };
         var st = p.state;
         var pts = (window.LabCore ? window.LabCore.getPoints(st.rows || []).length : 0);
@@ -79,16 +98,38 @@
         mockStore(db);
         return { ok: true, savedAt: db[p.key].savedAt };
       }
+      case "result": {
+        var tv0 = mockTrue();
+        if (tv0 === null) return { ok: true, ready: false, reason: "pending" };
+        var rec = db[p.key];
+        if (!rec || !rec.submitted) return { ok: true, ready: false, reason: "not_submitted" };
+        var e = relErr(rec.ep2v, tv0);
+        return e === null ? { ok: true, ready: false, reason: "no_ep2" } : { ok: true, ready: true, relErr: e };
+      }
+      case "setTrue": {
+        if (p.password !== MOCK_PASSWORD) throw apiError("auth");
+        var raw = p.value;
+        if (raw === null || raw === undefined || String(raw).trim() === "") {
+          try { localStorage.removeItem(MOCK_TRUE); } catch (e2) { /* ignore */ }
+          return { ok: true, trueValue: null };
+        }
+        var v = window.LabCore ? window.LabCore.parseNum(raw) : Number(raw);
+        if (!(v > 0 && v < 1000)) throw apiError("bad_value");
+        v = Math.round(v * 10000) / 10000;
+        try { localStorage.setItem(MOCK_TRUE, String(v)); } catch (e3) { /* ignore */ }
+        return { ok: true, trueValue: v };
+      }
       case "list":
       case "all":
       case "get": {
         if (p.password !== MOCK_PASSWORD) throw apiError("auth");
+        var tv = mockTrue();
         if (p.action === "get") {
           if (!db[p.key]) throw apiError("not_found");
-          return { ok: true, student: db[p.key] };
+          return { ok: true, student: withErr(db[p.key], tv), trueValue: tv };
         }
-        var list = Object.keys(db).map(function (k) { return p.action === "all" ? db[k] : summary(db[k]); });
-        return { ok: true, students: list };
+        var list = Object.keys(db).map(function (k) { return withErr(p.action === "all" ? db[k] : summary(db[k]), tv); });
+        return { ok: true, students: list, trueValue: tv };
       }
       default:
         throw apiError("bad_action");
@@ -156,9 +197,17 @@
     this.force = false;
     this.urgent = false;
     this.hiddenHash = null;
+    this.stopped = false;
     var self = this;
     window.addEventListener("online", function () { if (self.isDirty()) self._schedule(300); });
   }
+
+  /** Final (after the submission was confirmed): no more saves of any kind. */
+  Saver.prototype.stop = function () {
+    this.stopped = true;
+    clearTimeout(this.timer);
+    this.savedSeq = this.seq;
+  };
 
   Saver.prototype.isDirty = function () { return this.seq !== this.savedSeq; };
 
@@ -184,6 +233,7 @@
 
   /** Something changed: autosave after the debounce delay (capped, respecting the min interval). */
   Saver.prototype.markDirty = function () {
+    if (this.stopped) return;
     this.seq += 1;
     this._noteChange();
     if (this.failures > 0) return; // retry timer already running
@@ -197,6 +247,7 @@
    * If a request is already in flight, the next one starts right after it.
    */
   Saver.prototype.saveNow = function () {
+    if (this.stopped) return;
     this.seq += 1;
     this._noteChange();
     this.force = true;
@@ -214,6 +265,7 @@
 
   Saver.prototype._run = function () {
     var self = this;
+    if (this.stopped) return;
     if (this.inFlight) return; // will re-check when the request finishes
     if (!this.isDirty()) return;
     var built = this.opts.build();
@@ -235,6 +287,7 @@
     call(built.payload).then(function () {
       var latency = Date.now() - t0;
       self.inFlight = false;
+      if (self.stopped) return;
       self.failures = 0;
       self.savedSeq = seqAtSend;
       self.savedHash = built.hash;
@@ -255,6 +308,7 @@
       }
     }, function (err) {
       self.inFlight = false;
+      if (self.stopped) return;
       self.failures += 1;
       var code = err && err.code;
       var delay = Math.min(60000, 5000 * Math.pow(2, self.failures - 1)) * (0.75 + Math.random() * 0.5);
@@ -276,7 +330,7 @@
    * keeps the highest revision.
    */
   Saver.prototype.flushBeacon = function () {
-    if (!this.isDirty()) return;
+    if (this.stopped || !this.isDirty()) return;
     var built = this.opts.build();
     if (!built || built.hash === this.savedHash) return;
     if (built.hash === this.hiddenHash) return; // already sent (visibilitychange + pagehide both fire)
@@ -285,6 +339,7 @@
 
   /** Page visible again: send pending changes soon. */
   Saver.prototype.resume = function () {
+    if (this.stopped) return;
     if (this.isDirty() && !this.inFlight) this._schedule(this.failures > 0 ? 1000 : this.debounce);
   };
 

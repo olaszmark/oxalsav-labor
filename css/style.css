@@ -174,7 +174,7 @@ h3 { font-size: 1rem; margin: 0 0 0.4rem; }
 .ro-v b { color: var(--red); }
 .ro-d b { color: var(--orange); }
 .ro-i b { color: var(--blue); }
-.plot-controls { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+.plot-controls { display: flex; flex-wrap: wrap; justify-content: flex-start; align-items: center; gap: 0 1.1rem; margin-top: 0.5rem; }
 .gesture-hint { margin: 0.35rem 0 0; text-align: center; }
 
 .switch { display: inline-flex; align-items: center; gap: 0.55rem; cursor: pointer; font-weight: 600; min-height: 40px; }
@@ -184,6 +184,8 @@ h3 { font-size: 1rem; margin: 0 0 0.4rem; }
 .switch input:checked + .switch-ui { background: var(--orange); }
 .switch input:checked + .switch-ui::after { transform: translateX(18px); }
 .switch input:focus-visible + .switch-ui { outline: 3px solid rgba(57, 73, 171, 0.4); }
+.switch input[id$="p1Toggle"]:checked + .switch-ui { background: var(--ep1); }
+.switch input[id$="p2Toggle"]:checked + .switch-ui { background: var(--ep2); }
 
 .ep-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 0.75rem; }
 .ep-buttons .btn { font-size: 0.9rem; line-height: 1.2; }
@@ -208,6 +210,25 @@ h3 { font-size: 1rem; margin: 0 0 0.4rem; }
 .submit-state.ok { background: #e8f5e9; color: var(--ok); }
 .submit-state.warn { background: #fff3cd; color: #6b4b00; }
 .submit-state.pending { background: #e3f2fd; color: #0d47a1; }
+.submit-state.muted { font-weight: 500; color: #455a64; }
+
+/* after submitting: nothing can be edited any more */
+body.locked .data-table input { background: #f4f6fa; color: #37474f; }
+body.locked .del-btn { visibility: hidden; }
+body.locked .result-row .link-btn { display: none; } /* no "Törlés" of an EP after submitting */
+
+/* results screen */
+.result-card { text-align: center; padding: 1.6rem 1.1rem; }
+.result-text { font-size: 1.25rem; font-weight: 700; line-height: 1.45; margin: 0; color: #1a237e; }
+.result-card.waiting .result-text { font-size: 1.05rem; font-weight: 600; color: #37474f; }
+
+/* submit confirmation */
+.modal { position: fixed; inset: 0; z-index: 60; background: rgba(20, 26, 40, 0.55); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.modal[hidden] { display: none; }
+.modal-card { background: #fff; border-radius: 12px; padding: 1.2rem 1.1rem 1rem; max-width: 420px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
+.modal-card p { margin: 0 0 1rem; font-size: 1.05rem; font-weight: 600; line-height: 1.45; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
+.modal-actions .btn { min-width: 7.5rem; }
 
 /* ------------------------------------------------------------ toast */
 .toast {
@@ -289,4 +310,9 @@ h3 { font-size: 1rem; margin: 0 0 0.4rem; }
 .teacher .plot-box { height: min(70vw, 60vh); }
 @media (max-width: 899px) { .detail-grid .plot-card { order: -1; } }
 .login-error { color: var(--err); font-weight: 600; }
+.true-form label { display: block; font-weight: 600; margin-bottom: 6px; }
+.true-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.true-row input { flex: 1 1 8rem; max-width: 12rem; font-size: 1.05rem; padding: 0.5rem 0.6rem; border: 1px solid #b0bec5; border-radius: 8px; }
+.true-form .field-error { margin: 6px 0 0; }
+.true-current { margin: 0.6rem 0 0.2rem; }
 .auto-label { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.9rem; min-height: 44px; }

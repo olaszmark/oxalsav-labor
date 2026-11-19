@@ -7,29 +7,39 @@
  * Container-bound script of a Google Sheet (Extensions → Apps Script).
  * Deploy as Web app: Execute as "Me", Who has access "Anyone".
  *
- * Script property (Project Settings → Script properties):
+ * Script properties (Project Settings → Script properties):
  *   TEACHER_PASSWORD = <your password>     (required for the teacher page)
+ *   TRUE_VALUE_EP2   = true NaOH volume of the 2nd equivalence point (cm³) – set from the teacher page
  *
  * Requests: POST, body = JSON text, Content-Type text/plain (no CORS preflight).
  *   {action:"save", key, rev, state}               – student autosave / submit (no password)
- *   {action:"list", password}                      – newest version of every student (summary)
- *   {action:"get",  password, key}                 – newest version of one student incl. full state
- *   {action:"all",  password}                      – newest version of every student incl. full state (CSV export)
+ *   {action:"result", key}                         – student's relative error after submitting (no password;
+ *                                                    returns only the percentage, never the true value)
+ *   {action:"list", password}                      – current version of every student (summary) + true value
+ *   {action:"get",  password, key}                 – current version of one student incl. full state
+ *   {action:"all",  password}                      – current version of every student incl. full state (CSV export)
+ *   {action:"setTrue", password, value}            – store the true value ("24,15"; "" clears it)
  * Every response: {ok:true, ...} or {ok:false, error:"<code>"}.
  *
  * Storage model: APPEND-ONLY. Every save adds one row to the "Adatok" tab (a log).
  * The write lock covers only appendRow + flush (no reads), so it is held as briefly as possible.
- * Reads take no lock: for every student (Kulcs) the row with the highest Rev wins – the same
- * revision may arrive twice (beacon + normal save), then the later row wins. An older save that
- * arrives late is therefore ignored at read time and can never hide a newer one.
+ * Reads take no lock and pick the current version of every student (Kulcs):
+ *   - SUBMITTED students: the FIRST submitted version (lowest Rev among the rows with Beküldve = igen;
+ *     for an equal Rev the earlier row) is final – any later save is ignored at read time;
+ *   - otherwise the row with the highest Rev (for an equal Rev the later row wins), so an older save
+ *     that arrives late can never hide a newer one.
+ * Relative error = |2. EP volume (as shown, 2 decimals) − true value| / true value × 100, 1 decimal,
+ * computed at read time, so changing the true value updates every student at once.
  * Sheet menu "Oxálsav labor → Összesítő frissítése" writes one row per student to the "Összesítő" tab.
  */
 
 var SHEET_NAME = 'Adatok';
 var SUMMARY_SHEET = 'Összesítő';
+var TRUE_PROP = 'TRUE_VALUE_EP2';
+// column 7 is kept so the log layout stays the same as before (no longer used: submitting is final)
 var HEADERS = [
   'Kulcs', 'Név', 'Eszköz', 'Utolsó mentés', 'Beküldve', 'Beküldés ideje', 'Beküldés után módosítva',
-  '1. EP V (cm3)', '1. EP dĨ/dV / (mA/cm³)', '2. EP V (cm3)', '2. EP dĨ/dV / (mA/cm³)', 'Mérési pontok', 'Rev', 'Állapot (JSON)'
+  '1. EP Vvalós / cm3', '1. EP Meredekség', '2. EP Vvalós / cm3', '2. EP Meredekség', 'Mérési pontok', 'Rev', 'Állapot (JSON)'
 ];
 var COL = {
   KEY: 1, NAME: 2, DEVICE: 3, SAVED: 4, SUBMITTED: 5, SUBMITTED_AT: 6, CHANGED: 7,
@@ -57,9 +67,11 @@ function doPost(e) {
   try {
     switch (req.action) {
       case 'save': return json_(save_(req));
+      case 'result': return json_(result_(req));
       case 'list': return json_(checkPassword_(req) || list_(false));
       case 'all': return json_(checkPassword_(req) || list_(true));
       case 'get': return json_(checkPassword_(req) || get_(req));
+      case 'setTrue': return json_(checkPassword_(req) || setTrue_(req));
       default: return json_({ ok: false, error: 'bad_action' });
     }
   } catch (err) {
@@ -118,33 +130,71 @@ function save_(req) {
 }
 
 function list_(withState) {
+  var tv = trueValue_();
   var sh = getSheet_(false);
-  if (!sh) return { ok: true, students: [], rows: 0 };
+  if (!sh) return { ok: true, students: [], rows: 0, trueValue: tv };
   var latest = latestRows_(sh);
-  var out = latest.map(function (L) { return rowToObj_(L.values, false, L.saves); });
+  var out = latest.map(function (L) { return rowToObj_(L.values, L.saves, tv); });
   if (withState) {
-    for (var k = 0; k < latest.length; k++) out[k] = withState_(sh, latest[k], out[k]);
+    for (var k = 0; k < latest.length; k++) out[k] = withState_(sh, latest[k], out[k], tv);
   }
-  return { ok: true, students: out, rows: latest.totalRows };
+  return { ok: true, students: out, rows: latest.totalRows, trueValue: tv };
 }
 
 function get_(req) {
+  var tv = trueValue_();
   var sh = getSheet_(false);
   if (!sh) return { ok: false, error: 'not_found' };
   var key = String(req.key || '');
-  var latest = latestRows_(sh).filter(function (L) { return L.key === key; })[0];
+  var latest = latestRows_(sh, key)[0];
   if (!latest) return { ok: false, error: 'not_found' };
-  return { ok: true, student: withState_(sh, latest, rowToObj_(latest.values, false, latest.saves)) };
+  return { ok: true, student: withState_(sh, latest, rowToObj_(latest.values, latest.saves, tv), tv), trueValue: tv };
+}
+
+/**
+ * Student's result after submitting. No password: the key (random device id + name) identifies the
+ * student. Returns ONLY the relative error – never the true value.
+ * {ok:true, ready:false, reason}   – "pending" (no true value yet) / "not_submitted" / "no_ep2"
+ * {ok:true, ready:true, relErr}    – relative error in %, 1 decimal
+ */
+function result_(req) {
+  var key = String(req.key || '');
+  if (!key || key.length > 120) return { ok: false, error: 'bad_request' };
+  var tv = trueValue_();
+  if (tv === null) return { ok: true, ready: false, reason: 'pending' }; // cheap: no Sheet read
+  var sh = getSheet_(false);
+  var latest = sh ? latestRows_(sh, key)[0] : null;
+  if (!latest || !latest.final) return { ok: true, ready: false, reason: 'not_submitted' };
+  var o = rowToObj_(latest.values, latest.saves, tv);
+  if (o.relErr === null) return { ok: true, ready: false, reason: 'no_ep2' };
+  return { ok: true, ready: true, relErr: o.relErr };
+}
+
+/** Teacher: store (or clear with "") the true volume of the 2nd equivalence point. */
+function setTrue_(req) {
+  var props = PropertiesService.getScriptProperties();
+  var raw = req.value;
+  if (raw === null || raw === undefined || String(raw).trim() === '') {
+    props.deleteProperty(TRUE_PROP);
+    return { ok: true, trueValue: null };
+  }
+  var v = typeof raw === 'number' ? raw : parseNum_(raw);
+  if (!(v > 0 && v < 1000)) return { ok: false, error: 'bad_value' };
+  v = Math.round(v * 10000) / 10000;
+  props.setProperty(TRUE_PROP, String(v));
+  return { ok: true, trueValue: v };
 }
 
 /* ================================================================ helpers */
 
 /**
- * Newest row per student: highest Rev; for an equal Rev the later row wins.
- * Reads the short columns (Kulcs … Rev) in ONE call; no lock.
- * Returns [{key, row, rev, saves, values, candidates}] with .totalRows.
+ * Current row per student (no lock; reads the short columns Kulcs … Rev in ONE call):
+ *   submitted → the FIRST submitted row (lowest Rev with Beküldve = igen; equal Rev: earlier row) is final;
+ *   otherwise → highest Rev; for an equal Rev the later row wins.
+ * onlyKey (optional): return just that student.
+ * Returns [{key, row, rev, saves, final, values, candidates}] with .totalRows.
  */
-function latestRows_(sh) {
+function latestRows_(sh, onlyKey) {
   var last = sh.getLastRow();
   var result = [];
   result.totalRows = Math.max(0, last - 1);
@@ -155,6 +205,7 @@ function latestRows_(sh) {
   for (var k = 0; k < data.length; k++) {
     var key = data[k][COL.KEY - 1];
     if (!key) continue;
+    if (onlyKey !== undefined && String(key) !== onlyKey) continue;
     var rev = Number(data[k][COL.REV - 1]) || 0;
     var b = best[key];
     if (!b) { b = best[key] = { key: String(key), saves: 0, candidates: [] }; order.push(key); }
@@ -163,8 +214,15 @@ function latestRows_(sh) {
   }
   for (var j = 0; j < order.length; j++) {
     var e = best[order[j]];
-    // newest first: highest rev, then latest row
-    e.candidates.sort(function (a, c) { return c.rev - a.rev || c.row - a.row; });
+    var submitted = e.candidates.filter(function (c) { return c.values[COL.SUBMITTED - 1] === 'igen'; });
+    e.final = submitted.length > 0;
+    if (e.final) {
+      // submitting is final: the first submitted version wins, later saves are ignored
+      e.candidates = submitted.sort(function (a, c) { return a.rev - c.rev || a.row - c.row; });
+    } else {
+      // newest first: highest rev, then latest row
+      e.candidates.sort(function (a, c) { return c.rev - a.rev || c.row - a.row; });
+    }
     e.row = e.candidates[0].row; e.rev = e.candidates[0].rev; e.values = e.candidates[0].values;
     result.push(e);
   }
@@ -172,14 +230,14 @@ function latestRows_(sh) {
 }
 
 /** Adds the full state (JSON column) of the newest readable row of a student. */
-function withState_(sh, latest, obj) {
+function withState_(sh, latest, obj, tv) {
   var cands = latest.candidates || [{ row: latest.row, values: latest.values }];
   for (var k = 0; k < cands.length && k < 3; k++) {
     var raw = sh.getRange(cands[k].row, COL.JSON).getValue();
     var st = null;
     try { st = JSON.parse(raw); } catch (e) { st = null; }
     if (st) {
-      var o = k === 0 ? obj : rowToObj_(cands[k].values, false, latest.saves);
+      var o = k === 0 ? obj : rowToObj_(cands[k].values, latest.saves, tv);
       o.state = st;
       if (st.name) o.name = st.name;
       return o;
@@ -216,7 +274,7 @@ function getSheet_(create) {
   return sh;
 }
 
-function rowToObj_(r, withState, saves) {
+function rowToObj_(r, saves, tv) {
   var o = {
     key: String(r[COL.KEY - 1]),
     name: String(r[COL.NAME - 1]).replace(/^'(?=[=+\-@])/, ''),
@@ -231,11 +289,22 @@ function rowToObj_(r, withState, saves) {
     rev: numOut_(r[COL.REV - 1]),
     saves: saves || 1
   };
-  if (withState) {
-    try { o.state = JSON.parse(r[COL.JSON - 1]); } catch (e) { o.state = null; }
-    if (o.state && o.state.name) o.name = o.state.name;
-  }
+  o.relErr = relErr_(o.ep2v, tv);
   return o;
+}
+
+/** The true value from the Script properties, or null if not set. */
+function trueValue_() {
+  var s = PropertiesService.getScriptProperties().getProperty(TRUE_PROP);
+  var v = s === null || s === undefined ? NaN : Number(s);
+  return v > 0 ? v : null;
+}
+
+/** |V2 − true| / true × 100 with V2 rounded to 2 decimals (as shown), result rounded to 1 decimal. */
+function relErr_(v2, tv) {
+  if (typeof v2 !== 'number' || !isFinite(v2) || !tv) return null;
+  var shown = Number(v2.toFixed(2));
+  return Math.round(Math.abs(shown - tv) / tv * 1000 + 1e-9) / 10;
 }
 
 /** Number of rows where both volume and current are valid non-negative numbers. */
@@ -279,12 +348,14 @@ function refreshSummary() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var src = ss.getSheetByName(SHEET_NAME);
   var latest = src ? latestRows_(src) : [];
-  var head = ['Név', 'Eszköz', 'Utolsó mentés', 'Beküldve', 'Beküldés ideje', 'Beküldés után módosítva',
-    '1. EP V (cm3)', '1. EP dĨ/dV / (mA/cm³)', '2. EP V (cm3)', '2. EP dĨ/dV / (mA/cm³)', 'Mérési pontok', 'Mentések száma'];
+  var tv = trueValue_();
+  var head = ['Név', 'Eszköz', 'Utolsó mentés', 'Beküldve', 'Beküldés ideje',
+    '1. EP Vvalós / cm3', '1. EP Meredekség', '2. EP Vvalós / cm3', '2. EP Meredekség', 'Relatív hiba (%)', 'Mérési pontok', 'Mentések száma'];
   var rows = latest.map(function (L) {
     var v = L.values;
+    var rel = relErr_(numOut_(v[COL.EP2V - 1]), tv);
     return [v[COL.NAME - 1], v[COL.DEVICE - 1], v[COL.SAVED - 1], v[COL.SUBMITTED - 1], v[COL.SUBMITTED_AT - 1],
-      v[COL.CHANGED - 1], v[COL.EP1V - 1], v[COL.EP1D - 1], v[COL.EP2V - 1], v[COL.EP2D - 1], v[COL.POINTS - 1], L.saves];
+      v[COL.EP1V - 1], v[COL.EP1D - 1], v[COL.EP2V - 1], v[COL.EP2D - 1], rel === null ? '' : rel, v[COL.POINTS - 1], L.saves];
   }).sort(function (a, b) { return String(a[0]).localeCompare(String(b[0]), 'hu'); });
   var sh = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
   sh.clearContents();
@@ -295,6 +366,7 @@ function refreshSummary() {
     sh.getRange(2, 1, rows.length, head.length).setValues(rows);
     sh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
     sh.getRange(2, 5, rows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+    sh.getRange(2, 10, rows.length, 1).setNumberFormat('0.0'); // Relatív hiba (%): always 1 decimal, e.g. 3,0
   }
   return rows.length;
 }
@@ -310,7 +382,10 @@ function setup() {
   console.log('Sheet "' + SHEET_NAME + '" OK. TEACHER_PASSWORD is ' + (pw ? 'set.' : 'NOT set – add it under Project Settings → Script properties!'));
 }
 
-/** Saves a test student twice, reads the newest version back, then deletes the test rows. */
+/**
+ * Saves a test student several times, reads the current version back, then deletes the test rows:
+ * a late older save must not win, and after submitting, a later save must not change what is shown.
+ */
 function selfTest() {
   var key = 'selftest01|ÖNTESZT tanuló';
   var st = { name: 'ÖNTESZT tanuló', deviceId: 'selftest01', rows: [{ v: '0', i: '1' }, { v: '1', i: '2,5' }], ep1: { v: 0.5, d: 0, i: 1.7 }, ep2: null, submitted: false };
@@ -319,10 +394,18 @@ function selfTest() {
   var back = get_({ key: key });
   console.log('save: ' + JSON.stringify(r1) + ' / late older save: ' + JSON.stringify(r0));
   console.log('read back: ' + JSON.stringify(back.student && { name: back.student.name, points: back.student.points, ep1v: back.student.ep1v, rev: back.student.rev }));
+  var sub = JSON.parse(JSON.stringify(st)); sub.ep2 = { v: 0.9, d: 1, i: 2 }; sub.submitted = true; sub.submittedAt = new Date().toISOString();
+  var r3 = save_({ action: 'save', key: key, rev: 3, state: sub });
+  var late = JSON.parse(JSON.stringify(sub)); late.ep2.v = 0.95;
+  var r4 = save_({ action: 'save', key: key, rev: 4, state: late }); // a save after submitting: must be ignored
+  var fin = get_({ key: key });
+  var subOk = !!(r3.ok && r4.ok && fin.ok && fin.student.rev === 3 && fin.student.ep2v === 0.9 && fin.student.submitted);
+  console.log('after submit + a later save: ' + JSON.stringify(fin.student && { rev: fin.student.rev, ep2v: fin.student.ep2v, submitted: fin.student.submitted }) +
+    (subOk ? ' – the later save is ignored' : ' – WRONG'));
   var sh = getSheet_(false);
   if (sh && sh.getLastRow() >= 2) {
     var keys = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues();
     for (var k = keys.length - 1; k >= 0; k--) if (keys[k][0] === key) sh.deleteRow(k + 2);
   }
-  console.log(r1.ok && r0.ok && back.ok && back.student.points === 2 && back.student.rev === 2 ? 'SELF TEST PASSED' : 'SELF TEST FAILED');
+  console.log(r1.ok && r0.ok && back.ok && back.student.points === 2 && back.student.rev === 2 && subOk ? 'SELF TEST PASSED' : 'SELF TEST FAILED');
 }

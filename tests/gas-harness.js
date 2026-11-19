@@ -53,7 +53,7 @@ function makeSheet(name) {
         },
         setFontWeight() { return range; },
         setBackground() { return range; },
-        setNumberFormat() { return range; }
+        setNumberFormat(f) { sh.formats.push({ row: r0, col: c0, rows, cols, format: f }); return range; }
       };
       return range;
     },
@@ -68,7 +68,8 @@ function makeSheet(name) {
     setFrozenRows(n) { this.frozen = n; },
     setColumnWidth() {},
     deleteRow(r) { this.data.splice(r - 1, 1); },
-    stats: { reads: 0, writes: 0, appends: 0 }
+    stats: { reads: 0, writes: 0, appends: 0 },
+    formats: []
   };
   return sheet;
 }
@@ -102,7 +103,13 @@ function loadGas(opts = {}) {
       })
     },
     CacheService: { getScriptCache: () => ({ get: (k) => (cache.has(k) ? cache.get(k) : null), put: (k, v) => cache.set(k, v) }) },
-    PropertiesService: { getScriptProperties: () => ({ getProperty: (k) => (props[k] === undefined ? null : props[k]) }) },
+    PropertiesService: {
+      getScriptProperties: () => ({
+        getProperty: (k) => (props[k] === undefined ? null : props[k]),
+        setProperty(k, v) { props[k] = String(v); return this; },
+        deleteProperty(k) { delete props[k]; return this; }
+      })
+    },
     Utilities: {
       DigestAlgorithm: { MD5: "md5" },
       Charset: { UTF_8: "utf8" },

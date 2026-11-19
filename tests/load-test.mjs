@@ -8,8 +8,13 @@
 //                       (10 s debounce, ≥ 60 s between autosaves, autosave ≤ 60 s after the first
 //                       unsaved change, one request at a time, retries),
 //                       immediate saves for EP Mentés/Törlés and page hides (beacons), then ALL press
-//                       Beküldés within 60 s. A simulated teacher polls the list every 30 s and opens a
-//                       detail view now and then. Ends with a "nothing lost" check and a PASS/FAIL table.
+//                       Beküldés within 60 s and confirm it in the dialog (some press "Mégse" first).
+//                       Submitting is final: the app stops saving, shows the results screen and asks for
+//                       the result every 30 s. When half of the class has submitted, the simulated teacher
+//                       enters the true value (restored to the old value at the end). Some students send a
+//                       stray save after submitting (like an old cached app) – the server must ignore it.
+//                       The teacher polls the list every 30 s and opens a detail view now and then.
+//                       Ends with a "nothing lost / submitted version is final" check and a PASS/FAIL table.
 //   bench               quick check (~1 min): 20 students × 3 saves, reports the server's lock hold time.
 //   stress              the old test: 70 students × 3 saves with 3–10 s pauses, all at once.
 //
@@ -77,8 +82,8 @@ function noteTiming(r) {
 }
 
 function studentState(k, deviceId, name, rows, extra = {}) {
-  return Object.assign({ version: 1, name, deviceId, key: deviceId + "|" + name, rows, showDeriv: true, ep1: null, ep2: null,
-    submitted: false, submittedAt: null, changedAfterSubmit: false }, extra);
+  return Object.assign({ version: 1, name, deviceId, key: deviceId + "|" + name, rows, ep1: null, ep2: null,
+    submitted: false, submittedAt: null, changedAfterSubmit: false, submitConfirmed: false, result: null }, extra);
 }
 const nameOf = (k) => "TERHELÉSTESZT " + String(k + 1).padStart(2, "0");
 const devOf = (k) => "lt" + runId + String(k).padStart(4, "0");
@@ -139,6 +144,9 @@ async function stress() {
 
 /* ================================================================== realistic */
 const DEBOUNCE = 10000, MIN_INTERVAL = 60000, MAX_WAIT = 60000; // = js/config.js
+const RESULT_POLL = 30000;                                         // = js/student.js
+const TRUE_VALUE = 24.15;                                          // the simulated teacher enters this
+const relErrOf = (v2, tv) => Math.round(Math.abs(Number(v2.toFixed(2)) - tv) / tv * 1000 + 1e-9) / 10; // = Code.gs
 const BUSY = /^(busy|timeout|http_429|http_503)$/;
 
 class SimStudent {
@@ -149,10 +157,11 @@ class SimStudent {
     this.rev = 0; this.seq = 0; this.savedSeq = 0; this.inFlight = false; this.lastSentAt = -1e9; this.failures = 0;
     this.timer = null; this.urgent = false; this.editTime = {}; this.urgentPending = []; this.lastConfirmed = null;
     this.status = "idle"; this.chainStart = null; this.unsavedSince = null; this.changedInFlight = null; this.hibaSince = null; this.maxHiba = 0; this.sawHiba = false; this.filled = 0; this.hidden = false;
+    this.stopped = false; this.submittedJson = null; this.confirmedAt = null; this.result = null; this.resultAt = null; this.cancelledOnce = false;
   }
   state() { return studentState(this.k, this.dev, this.name, this.rows, this.extra); }
   change() {
-    this.seq++; this.editTime[this.seq] = now(); if (this.extra.submitted) this.extra.changedAfterSubmit = true;
+    this.seq++; this.editTime[this.seq] = now();
     if (this.unsavedSince === null) this.unsavedSince = now();
     if (this.inFlight && this.changedInFlight === null) this.changedInFlight = now();
   }
@@ -162,7 +171,7 @@ class SimStudent {
     return Math.max(at, this.lastSentAt + MIN_INTERVAL) - now();
   }
   edit() {
-    if (this.hidden) return;
+    if (this.hidden || this.extra.submitted) return; // after Beküldés the table is locked
     const r = this.rows[this.filled % this.rows.length];
     r.i = (16.8 + Math.random() * 1.2).toFixed(2).replace(".", ",");
     this.filled++;
@@ -175,6 +184,7 @@ class SimStudent {
     this.schedule(this.autoWait());
   }
   saveNow(kind, mutate) {
+    if (this.stopped || (this.extra.submitted && kind !== "submit")) return;
     if (mutate) mutate();
     this.change();
     this.urgentPending.push({ seq: this.seq, t: now(), kind });
@@ -190,7 +200,7 @@ class SimStudent {
     this.status = s;
   }
   async run() {
-    if (this.inFlight || this.seq === this.savedSeq) return;
+    if (this.stopped || this.inFlight || this.seq === this.savedSeq) return;
     const seqAtSend = this.seq, rev = ++this.rev, st = this.state();
     this.urgent = false; this.inFlight = true; this.lastSentAt = now(); this.changedInFlight = null;
     const R = this.R, tSend = now();
@@ -208,6 +218,11 @@ class SimStudent {
       if (this.editTime[firstUnsaved] !== undefined) R.toMentve.push(now() - this.editTime[firstUnsaved]);
       this.savedSeq = seqAtSend;
       this.lastConfirmed = { rev, json: JSON.stringify(st) };
+      if (st.submitted) { // the server confirmed the submission: final → results screen, no more saves
+        this.stopped = true; this.submittedJson = JSON.stringify(st); this.confirmedAt = now();
+        R.confirmed++;
+        this.pollResult();
+      }
       this.urgentPending = this.urgentPending.filter((u) => {
         if (u.seq > seqAtSend) return true;
         (R.urgentLat[u.kind] = R.urgentLat[u.kind] || []).push(now() - u.t);
@@ -226,12 +241,32 @@ class SimStudent {
     }
   }
   beacon() { // page hidden: unload-safe request, delivery not confirmed
-    if (this.seq === this.savedSeq) return;
+    if (this.stopped || this.seq === this.savedSeq) return;
     const st = this.state(), rev = ++this.rev;
     this.R.beacons++;
     post({ action: "save", key: this.key, rev, state: st }).then((r) => { noteTiming(r); if (!r.ok) this.R.beaconErrors++; });
   }
-  resume() { this.hidden = false; if (this.seq !== this.savedSeq && !this.inFlight) this.schedule(this.failures > 0 ? 1000 : DEBOUNCE); }
+  resume() { this.hidden = false; if (!this.stopped && this.seq !== this.savedSeq && !this.inFlight) this.schedule(this.failures > 0 ? 1000 : DEBOUNCE); }
+  /** results screen: ask for the result now and every 30 s until the true value has been entered */
+  async pollResult() {
+    const R = this.R;
+    while (!R.stopPolling) {
+      const r = await post({ action: "result", key: this.key }, 60000);
+      R.resultReq.push({ ms: r.ms, ok: r.ok, ready: !!(r.ok && r.ready), afterTrue: R.trueSetAt !== null });
+      if (!r.ok) R.resultErrors++;
+      if (r.ok && ("trueValue" in r || JSON.stringify(r).includes(String(TRUE_VALUE)))) R.leaks++;
+      if (r.ok && r.ready) { this.result = r.relErr; this.resultAt = now(); return; }
+      await sleep(RESULT_POLL);
+    }
+  }
+  /** an old cached app (or a stray beacon) sends one more save after the submission */
+  async straySave() {
+    const st = JSON.parse(this.submittedJson);
+    st.rows[0].i = "99,99"; st.ep2 = { v: 30, d: 0.5, i: 18 }; st.changedAfterSubmit = true;
+    const r = await post({ action: "save", key: this.key, rev: ++this.rev, state: st });
+    noteTiming(r);
+    this.R.stray.push(r.ok);
+  }
 }
 
 async function realistic() {
@@ -240,11 +275,16 @@ async function realistic() {
   const password = await askHidden("Test deployment teacher password (input hidden): ");
   const chk = await post({ action: "list", password });
   if (!chk.ok) { console.error("Teacher password check failed: " + chk.error); process.exit(1); }
+  const probe = await post({ action: "result", key: "probe|probe" });
+  if (!probe.ok) { console.error(`The deployment does not know the "result" action (${probe.error}) – publish the new Code.gs to it first.`); process.exit(1); }
+  const prevTrue = typeof chk.trueValue === "number" ? chk.trueValue : null; // restored at the end
+  if (prevTrue !== null) { const c = await post({ action: "setTrue", password, value: "" }); if (!c.ok) { console.error("Could not clear the true value: " + c.error); process.exit(1); } }
   T0 = Date.now(); // the simulated lab starts now, not when the script was started
 
-  const R = { serverDelay: [], attempts: 0, failedAttempts: 0, errors: {}, toMentve: [], urgentLat: {}, saveLog: [], beacons: 0, beaconErrors: 0, submitConfirmedAt: 0, teacher: [], teacherErrors: 0 };
+  const R = { serverDelay: [], attempts: 0, failedAttempts: 0, errors: {}, toMentve: [], urgentLat: {}, saveLog: [], beacons: 0, beaconErrors: 0, submitConfirmedAt: 0, teacher: [], teacherErrors: 0,
+    confirmed: 0, resultReq: [], resultErrors: 0, leaks: 0, stray: [], trueSetAt: null, stopPolling: false, cancels: 0 };
   const burstStart = (RAMP + MIN * 60) * 1000;
-  const endBy = burstStart + BURST * 1000 + 240000;
+  const endBy = burstStart + BURST * 1000 + 300000;
   console.log(`Realistic test (run ${runId}): ${N} students, start over ${RAMP} s, typing ~${MIN} min, all press Beküldés within ${BURST} s at ~${Math.round(burstStart / 60000)} min; teacher poller: ${teacher ? "on" : "off"}`);
   console.log(`Expected duration ≈ ${Math.ceil(endBy / 60000 - 3)}–${Math.ceil(endBy / 60000)} min. Rows are named "${nameOf(0)}" …`);
 
@@ -269,10 +309,15 @@ async function realistic() {
       at(t, () => { s.hidden = true; s.beacon(); });
       at(t + rand(10000, 40000), () => s.resume());
     }
+    // Beküldés → confirmation dialog: most confirm after 1,5–5 s, every 5th presses "Mégse" first and confirms 10–30 s later
     const press = burstStart + rand(0, BURST * 1000);
-    lastPress = Math.max(lastPress, press);
-    at(press, () => s.saveNow("submit", () => { s.extra.submitted = true; s.extra.submittedAt = new Date().toISOString(); s.extra.changedAfterSubmit = false; }));
+    const cancelFirst = Math.random() < 0.2;
+    const confirmAt = press + (cancelFirst ? rand(10000, 30000) : rand(1500, 5000));
+    if (cancelFirst) R.cancels++;
+    lastPress = Math.max(lastPress, confirmAt);
+    at(confirmAt, () => s.saveNow("submit", () => { s.extra.submitted = true; s.extra.submittedAt = new Date().toISOString(); s.extra.changedAfterSubmit = false; }));
   }
+  const strayStudents = students.filter(() => Math.random() < 0.15);
 
   // simulated teacher: list every 30 s, a detail view every ~2 min
   let polls = 0, teacherStop = false;
@@ -294,19 +339,32 @@ async function realistic() {
     }
   })();
 
-  // progress + wait until everyone is saved (or the time limit)
+  // progress + wait until everyone is saved and has a result (or the time limit)
   let lastLog = 0;
+  const strayDone = new Set();
   while (now() < endBy) {
     await sleep(1000);
+    // the teacher enters the true value when half of the class has submitted
+    if (R.trueSetAt === null && R.confirmed >= N / 2) {
+      const r = await post({ action: "setTrue", password, value: String(TRUE_VALUE).replace(".", ",") });
+      R.trueSetAt = now();
+      console.log(`  ${(now() / 60000).toFixed(1)} min: ${R.confirmed}/${N} submitted → teacher enters the true value (${r.ok ? "ok" : r.error})`);
+    }
+    for (const s of strayStudents) {
+      if (s.confirmedAt !== null && !strayDone.has(s) && now() > s.confirmedAt + 5000 + (s.k % 25) * 1000) { strayDone.add(s); s.straySave(); }
+    }
     const pressedAll = now() > lastPress + 1000;
     const clean = students.every((s) => !s.inFlight && s.seq === s.savedSeq);
+    const results = students.every((s) => s.result !== null);
     if (now() - lastLog > 60000) {
       lastLog = now();
       const err = students.filter((s) => s.status === "error").length;
       console.log(`  ${(now() / 60000).toFixed(1)} min: saves ${R.attempts - R.failedAttempts}/${R.attempts} ok, showing Hiba now: ${err}, unsaved: ${students.filter((s) => s.seq !== s.savedSeq).length}`);
     }
-    if (pressedAll && clean) break;
+    if (pressedAll && clean && results && strayDone.size === strayStudents.length) break;
   }
+  R.stopPolling = true;
+  await sleep(2000); // let the stray saves finish
   timers.forEach(clearTimeout);
   students.forEach((s) => { clearTimeout(s.timer); s.setStatus(s.status === "error" ? "error_end" : s.status); });
   teacherStop = true;
@@ -321,12 +379,23 @@ async function realistic() {
   const listMs = Date.now() - tList;
   const server = {};
   (all.students || []).forEach((s) => { server[s.key] = s; });
-  let lost = 0, unsaved = 0, notSubmitted = 0;
+  // restore the true value the test deployment had before
+  const restore = await post({ action: "setTrue", password, value: prevTrue === null ? "" : String(prevTrue) });
+  let lost = 0, unsaved = 0, notSubmitted = 0, strayWon = 0, noResult = 0, wrongResult = 0;
+  const resultWait = [];
   for (const s of students) {
     if (s.seq !== s.savedSeq) unsaved++;
     const sv = server[s.key];
-    if (!sv || !s.lastConfirmed || sv.rev !== s.lastConfirmed.rev || JSON.stringify(sv.state) !== s.lastConfirmed.json) lost++;
+    // submitted: the teacher must see exactly the submitted version (later stray saves ignored)
+    const expected = s.submittedJson || (s.lastConfirmed && s.lastConfirmed.json);
+    if (!sv || !expected || JSON.stringify(sv.state) !== expected) { lost++; if (strayStudents.includes(s)) strayWon++; }
     if (!sv || !sv.submitted) notSubmitted++;
+    if (s.result === null) noResult++;
+    else {
+      const exp = relErrOf(JSON.parse(s.submittedJson).ep2.v, TRUE_VALUE);
+      if (s.result !== exp) wrongResult++;
+      resultWait.push(s.resultAt - Math.max(R.trueSetAt, s.confirmedAt));
+    }
   }
 
   // do teacher reads slow down saves? compare saves that overlap a teacher read with the others
@@ -355,9 +424,14 @@ async function realistic() {
   console.log(`Saves overlapping a teacher read: ${stats(during.map((x) => x.ms))}; hold ${stats(during.map((x) => x.hold).filter((x) => x != null))}`);
   console.log(`Saves without a teacher read:     ${stats(outside.map((x) => x.ms))}; hold ${stats(outside.map((x) => x.hold).filter((x) => x != null))}`);
   console.log(`Final: list ${fmt(listMs)} (${lst.rows ?? "?"} rows), CSV "all" ${fmt(allMs)}; unsaved at end: ${unsaved}; lost: ${lost}; not submitted: ${notSubmitted}`);
+  const resPending = R.resultReq.filter((x) => x.ok && !x.ready).map((x) => x.ms), resReady = R.resultReq.filter((x) => x.ok && x.ready).map((x) => x.ms);
+  console.log(`Confirmation dialog: ${R.cancels} students pressed "Mégse" first. Stray saves after submitting: ${R.stray.length} (accepted into the log: ${R.stray.filter(Boolean).length}, changed what the teacher sees: ${strayWon})`);
+  console.log(`Result requests: ${R.resultReq.length}, errors ${R.resultErrors}; "pending" answers ${stats(resPending)}; with the result ${stats(resReady)}`);
+  console.log(`Result on the student's screen after the true value was entered (or after submitting, if later): ${stats(resultWait)}; no result: ${noResult}; wrong result: ${wrongResult}; true value leaked: ${R.leaks}`);
+  console.log(`True value restored to ${prevTrue === null ? "(not set)" : prevTrue}: ${restore.ok ? "ok" : restore.error}`);
 
   const crit = [
-    ["Nothing lost (server = last save of every student)", lost === 0],
+    ["Nothing lost; teacher sees exactly the submitted version (stray later saves ignored)", lost === 0],
     ["Every save eventually succeeded (nothing unsaved at the end)", unsaved === 0],
     ["All students submitted", notSubmitted === 0],
     ["Server delay (send → confirmed): p95 ≤ 30 s", (pct(R.serverDelay, 0.95) ?? 0) <= 30000],
@@ -367,7 +441,10 @@ async function realistic() {
     ["Failed attempts (retries) ≤ 10 %", retryRatio <= 0.10],
     ["No student shows \"Hiba\" > 60 s in a row", maxHiba <= 60000],
     ["Teacher list ≤ 5 s (max)", !teacher || (listT.length > 0 && Math.max(...listT) <= 5000)],
-    ["CSV \"all\" ≤ 20 s", all.ok && allMs <= 20000]
+    ["CSV \"all\" ≤ 20 s", all.ok && allMs <= 20000],
+    ["Every student got the correct result; the true value never reached a student", noResult === 0 && wrongResult === 0 && R.leaks === 0],
+    ["Result shown ≤ 60 s after the true value was entered (30 s polling)", resultWait.length === N && Math.max(...resultWait) <= 60000],
+    ["Result requests: no errors", R.resultErrors === 0]
   ];
   console.log("\nPass criteria:");
   crit.forEach(([n, okk]) => console.log(`  ${okk ? "PASS" : "FAIL"}  ${n}`));

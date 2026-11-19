@@ -12,8 +12,11 @@
   var saver = null;
   var selecting = 0;          // 0 = none, 1 or 2 = choosing that equivalence point
   var cursorInfo = null;
-  var confirmedSubmitAt = null; // submittedAt value the server has confirmed
   var lastDeleted = null;
+  var lastStatus = null;      // last save status ("saving", "error", …) – shown on the submit card while submitting
+  var view = { deriv: false, ep1: true, ep2: true }; // plot toggles; every page open starts like this
+  var resultTimer = 0;
+  var RESULT_POLL_MS = CFG.RESULT_POLL_MS || 30000; // light polling until the teacher enters the true value
 
   /* ------------------------------------------------------------ storage */
 
@@ -44,12 +47,13 @@
       deviceId: dev,
       key: dev + "|" + name,
       rows: C.rowsFromPresets(CFG.PRESET_VOLUMES || []),
-      showDeriv: true,
       ep1: null,
       ep2: null,
-      submitted: false,
+      submitted: false,          // the student confirmed "Beküldés" (final: editing is locked from here on)
       submittedAt: null,
-      changedAfterSubmit: false,
+      changedAfterSubmit: false, // always false now (kept for the server's log layout)
+      submitConfirmed: false,    // the server confirmed the submitted version → results screen
+      result: null,              // {relErr, at} last result received from the server
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
@@ -75,8 +79,8 @@
 
   /** Called after every change made by the student. */
   function changed(viewOnly, urgent) {
+    if (state.submitted) return; // submitting is final: nothing is saved after it
     state.updatedAt = new Date().toISOString();
-    if (state.submitted && !viewOnly) state.changedAfterSubmit = true;
     persistLocal();
     if (urgent) saver.saveNow(); else saver.markDirty();
     renderSubmitState();
@@ -93,7 +97,14 @@
       build: buildPayload,
       onStatus: setStatus,
       onSaved: function (payload) {
-        if (payload.state.submitted) confirmedSubmitAt = payload.state.submittedAt;
+        // the server has the submitted version → it is final: results screen
+        if (payload.state.submitted && state.submitted && !state.submitConfirmed) {
+          state.submitConfirmed = true;
+          state.submitConfirmedAt = new Date().toISOString();
+          persistLocal();
+          showResults();
+          return;
+        }
         renderSubmitState();
       }
     });
@@ -129,7 +140,9 @@
     $("studentName").textContent = state.name;
     $("topTitle").textContent = CFG.TITLE ? shortTitle(CFG.TITLE) : "Oxálsav titrálás";
     $("deviceInfo").textContent = "Eszközazonosító: " + state.deviceId;
-    $("derivToggle").checked = state.showDeriv !== false;
+    $("derivToggle").checked = view.deriv;
+    $("ep1Toggle").checked = view.ep1;
+    $("ep2Toggle").checked = view.ep2;
 
     plot = new window.LabPlot($("plot"), {
       onCursor: onCursor,
@@ -139,6 +152,8 @@
     renderTable();
     refreshComputed();
     renderEps();
+    if (state.submitConfirmed) { showResults(); return; } // final: results screen, nothing more to save
+    if (state.submitted) { lockEditing(); saver.saveNow(); renderSubmitState(); return; } // still sending
     renderSubmitState();
     if (isNew) saver.saveNow(); // register the student on the server right away
     else saver.markDirty(); // make sure the server has the latest version after a reload
@@ -172,6 +187,7 @@
    */
   function setStatus(s, info) {
     var el = $("saveStatus");
+    lastStatus = { s: s, info: info || null };
     // never claim "saved on the phone" if writing to the phone's storage failed
     if (s === "pending" && localSaveFailed) { s = "error"; info = { code: "storage" }; }
     el.className = "save-status " + ({ pending: "local", saving: "sending", saved: "saved", error: "error" }[s] || "");
@@ -182,6 +198,7 @@
       el.textContent = info && info.code === "storage" ? "Hiba – a telefon tárhelye megtelt"
         : info && info.offline ? "Nincs internet – újrapróbálás" : "Hiba – újrapróbálás";
     } else el.textContent = "–";
+    if (state && state.submitted && !state.submitConfirmed) renderSubmitState();
   }
 
   /* ------------------------------------------------------------- table */
@@ -237,7 +254,7 @@
       ep.d = valueAt(series.deriv, ep.v);
       ep.i = valueAt(series.current, ep.v);
     });
-    plot.setData({ series: series, showDeriv: state.showDeriv !== false, ep1: state.ep1, ep2: state.ep2 });
+    plot.setData({ series: series, showDeriv: view.deriv, showEp1: view.ep1, showEp2: view.ep2, ep1: state.ep1, ep2: state.ep2 });
     var n = series.current.length;
     $("pointCount").textContent = n + " mérési pont";
     $("sortHint").hidden = C.isSortedByVolume(state.rows);
@@ -260,9 +277,9 @@
     if (!info) {
       el.innerHTML = "Érintsd meg a grafikont az értékek leolvasásához.";
     } else {
-      var html = '<span class="ro-v">V = <b>' + C.formatNum(info.x, 2) + "</b> cm³</span>";
+      var html = '<span class="ro-v">V<sub>valós</sub> = <b>' + C.formatNum(info.x, 2) + "</b> cm³</span>";
       if (info.on === "deriv") {
-        html += '<span class="ro-d">dĨ/dV = <b>' + (info.d === null ? "–" : C.formatDeriv(info.d)) + "</b> mA/cm³</span>";
+        html += '<span class="ro-d">Meredekség = <b>' + (info.d === null ? "–" : C.formatDeriv(info.d)) + "</b></span>";
       } else {
         html += '<span class="ro-i">Ĩ = <b>' + (info.i === null ? "–" : C.formatNum(info.i, 3)) + "</b> mA</span>";
       }
@@ -274,14 +291,22 @@
   /* ---------------------------------------------------- equivalence points */
 
   function startSelect(n) {
+    if (state.submitted) return;
     selecting = n;
+    // full diagram + Meredekség on, so the red marker reads Meredekség values as the instruction says
+    plot.resetZoom();
+    if (!view.deriv) {
+      view.deriv = true;
+      $("derivToggle").checked = true;
+      plot.setData({ showDeriv: true });
+    }
     $("epButtons").hidden = true;
     $("epSelect").hidden = false;
     $("epSelect").className = "ep-select ep" + n;
     $("epSelectText").innerHTML = n === 1
-      ? "<b>1. ekvivalenciapont kijelölése.</b> Érintsd meg vagy húzd az ujjad a grafikonon. Keresd meg, ahol a <b>derivált = 0</b>, majd nyomd meg a Mentés gombot."
-      : "<b>2. ekvivalenciapont kijelölése.</b> Érintsd meg vagy húzd az ujjad a grafikonon. Keresd meg a <b>derivált maximumát</b>, majd nyomd meg a Mentés gombot.";
-    $("epSelectShort").textContent = n === 1 ? "1. EP (derivált = 0):" : "2. EP (derivált max.):";
+      ? "<b>1. ekvivalenciapont kijelölése.</b> Érintsd meg a grafikont és a piros jelölőt az ujjaddal húzva keresd meg, ahol a <b>Meredekség = 0</b>, majd nyomd meg a Mentés gombot."
+      : "<b>2. ekvivalenciapont kijelölése.</b> Érintsd meg a grafikont és a piros jelölőt az ujjaddal húzva keresd meg a <b>Meredekség maximumát</b>, majd nyomd meg a Mentés gombot.";
+    $("epSelectShort").textContent = n === 1 ? "1. EP (Meredekség = 0):" : "2. EP (Meredekség max.):";
     $("plotBox").classList.add("selecting", "sel-ep" + n);
     var ep = state["ep" + n];
     if (ep) plot.setCursor(ep.v);
@@ -310,23 +335,24 @@
     endSelect();
     plot.setData({ ep1: state.ep1, ep2: state.ep2 });
     renderEps();
-    changed(false, true); // immediate server save, bypassing the 5 s / 20 s throttle
+    changed(false, true); // immediate server save, bypassing the debounce / min interval
     toast(n + ". ekvivalenciapont elmentve.");
     if (n === 1 && !state.ep2) $("ep2Btn").classList.add("pulse");
   }
 
   function deleteEp(n) {
+    if (state.submitted) return;
     if (!window.confirm("Biztosan törlöd a(z) " + n + ". ekvivalenciapontot?")) return;
     state["ep" + n] = null;
     plot.setData({ ep1: state.ep1, ep2: state.ep2 });
     renderEps();
-    changed(false, true); // immediate server save, bypassing the 5 s / 20 s throttle
+    changed(false, true); // immediate server save, bypassing the debounce / min interval
   }
 
   function epText(ep) {
     if (!ep) return "még nincs kijelölve";
-    return '<span class="nowrap">V = <b>' + C.formatNum(ep.v, 2) + '</b> cm³</span> &nbsp; <span class="nowrap">dĨ/dV = <b>' +
-      (ep.d === null || ep.d === undefined ? "–" : C.formatDeriv(ep.d)) + "</b> mA/cm³</span>";
+    return '<span class="nowrap">V<sub>valós</sub> = <b>' + C.formatNum(ep.v, 2) + '</b> cm³</span> &nbsp; <span class="nowrap">Meredekség = <b>' +
+      (ep.d === null || ep.d === undefined ? "–" : C.formatDeriv(ep.d)) + "</b></span>";
   }
 
   function renderEps() {
@@ -339,48 +365,110 @@
       $("ep" + n + "Btn").classList.toggle("done", !!ep);
     });
     if (state.ep2) $("ep2Btn").classList.remove("pulse");
+    if (state && !state.submitted) renderSubmitState(); // "Beküldés" needs both equivalence points
   }
 
   /* ------------------------------------------------------------- submit */
 
   function renderSubmitState() {
     var el = $("submitState");
+    var ready = !!(state.ep1 && state.ep2);
+    $("retryBtn").hidden = true;
     if (!state.submitted) {
-      el.className = "submit-state";
-      el.textContent = "Még nem küldted be.";
-      $("submitBtn").textContent = "Beküldés";
+      $("submitBtn").hidden = false;
+      $("submitBtn").disabled = !ready;
+      el.className = "submit-state" + (ready ? "" : " muted");
+      el.textContent = ready ? "Még nem küldted be." : "A beküldéshez előbb mentsd el mindkét ekvivalenciapontot.";
       return;
     }
-    var t = hhmm(new Date(state.submittedAt));
-    if (state.changedAfterSubmit) {
+    // submitted, waiting for the server's confirmation (then the results screen replaces this card)
+    $("submitBtn").hidden = true;
+    $("submitNote").hidden = true;
+    var failed = lastStatus && lastStatus.s === "error";
+    if (failed) {
+      var why = lastStatus.info && lastStatus.info.offline ? "nincs internetkapcsolat"
+        : lastStatus.info && lastStatus.info.code === "storage" ? "a telefon tárhelye megtelt" : "szerverhiba";
       el.className = "submit-state warn";
-      el.textContent = "Beküldve " + t + ", de azóta módosítottál. Küldd be újra!";
-      $("submitBtn").textContent = "Újra beküldés";
-    } else if (confirmedSubmitAt !== state.submittedAt) {
-      el.className = "submit-state pending";
-      el.textContent = "Beküldés folyamatban… (ha nincs internet, automatikusan újrapróbáljuk)";
-      $("submitBtn").textContent = "Újra beküldés";
+      el.textContent = "Nem sikerült beküldeni (" + why + "). Semmi sem veszett el: az adataid a telefonon vannak, " +
+        "és az alkalmazás automatikusan újrapróbálja. Most is újrapróbálhatod:";
+      $("retryBtn").hidden = false;
     } else {
-      el.className = "submit-state ok";
-      el.textContent = "✔ Beküldve " + t + ". Ha módosítasz, küldd be újra.";
-      $("submitBtn").textContent = "Újra beküldés";
+      el.className = "submit-state pending";
+      el.textContent = "Beküldés folyamatban…";
     }
   }
 
   function submit() {
-    var missing = [];
-    if (C.getPoints(state.rows).length < 3) missing.push("kevés mérési pont van");
-    if (!state.ep1) missing.push("nincs kijelölve az 1. ekvivalenciapont");
-    if (!state.ep2) missing.push("nincs kijelölve a 2. ekvivalenciapont");
-    if (missing.length && !window.confirm("Figyelem: " + missing.join(", ") + ".\nBiztosan beküldöd így?")) return;
+    if (state.submitted || !state.ep1 || !state.ep2) return;
     if (selecting) endSelect();
+    openConfirm();
+  }
+
+  function openConfirm() {
+    $("confirmDlg").hidden = false;
+    $("confirmOk").focus();
+  }
+  function closeConfirm() { $("confirmDlg").hidden = true; }
+
+  /** The student confirmed: from here on the work is final. */
+  function doSubmit() {
+    closeConfirm();
+    if (state.submitted || !state.ep1 || !state.ep2) return;
     state.submitted = true;
     state.submittedAt = new Date().toISOString();
     state.changedAfterSubmit = false;
     state.updatedAt = state.submittedAt;
     persistLocal();
+    lockEditing();
     saver.saveNow();
     renderSubmitState();
+  }
+
+  /** After submitting: the table, the EP buttons and the submit button can no longer change anything. */
+  function lockEditing() {
+    if (selecting) endSelect();
+    document.body.classList.add("locked");
+    Array.prototype.forEach.call($("dataBody").querySelectorAll("input"), function (i) { i.readOnly = true; });
+    ["addRowBtn", "sortBtn", "ep1Btn", "ep2Btn", "ep1Del", "ep2Del", "submitBtn"].forEach(function (id) { $(id).disabled = true; });
+    Array.prototype.forEach.call($("dataBody").querySelectorAll(".del-btn"), function (b) { b.disabled = true; });
+  }
+
+  /* ----------------------------------------------------------- results */
+
+  function showResults() {
+    saver.stop(); // final: no more autosaves
+    if (selecting) endSelect();
+    closeConfirm();
+    hideToast();
+    ["dataCard", "plotCard", "submitCard"].forEach(function (id) { $(id).hidden = true; });
+    $("resultCard").hidden = false;
+    renderResult();
+    window.scrollTo(0, 0);
+    fetchResult();
+  }
+
+  function renderResult() {
+    var r = state.result;
+    $("resultText").textContent = r && typeof r.relErr === "number"
+      ? "Az általad meghatározott ekvivalenciapont " + C.formatNum(r.relErr, 1) + "%-kal tér el a valós értéktől."
+      : "Sikeres beküldés. Az eredményed hamarosan megjelenik ezen az oldalon.";
+    $("resultCard").classList.toggle("waiting", !(r && typeof r.relErr === "number"));
+  }
+
+  /** Asks the server for the relative error; until the teacher enters the true value, again every 30 s. */
+  function fetchResult() {
+    clearTimeout(resultTimer);
+    API.call({ action: "result", key: state.key }).then(function (res) {
+      if (res.ready && typeof res.relErr === "number") {
+        state.result = { relErr: res.relErr, at: new Date().toISOString() };
+        persistLocal();
+        renderResult();
+      } else {
+        resultTimer = setTimeout(fetchResult, RESULT_POLL_MS);
+      }
+    }, function () {
+      resultTimer = setTimeout(fetchResult, RESULT_POLL_MS);
+    });
   }
 
   /* ------------------------------------------------------------- toast */
@@ -405,7 +493,7 @@
 
     body.addEventListener("input", function (e) {
       var t = e.target;
-      if (!t.matches("input.num")) return;
+      if (!t.matches("input.num") || state.submitted) return;
       var k = rowIndexOf(t);
       if (k < 0) return;
       state.rows = C.updateRow(state.rows, k, t.dataset.f, t.value);
@@ -426,7 +514,7 @@
 
     body.addEventListener("click", function (e) {
       var b = e.target.closest(".del-btn");
-      if (!b) return;
+      if (!b || state.submitted) return;
       var k = rowIndexOf(b);
       if (k < 0) return;
       lastDeleted = { row: state.rows[k], index: k };
@@ -453,12 +541,14 @@
       renderTable(); refreshComputed(); changed();
     });
 
+    // view toggles: only change what is drawn (not saved, every page open starts with the defaults)
     $("derivToggle").addEventListener("change", function () {
-      state.showDeriv = this.checked;
-      plot.setData({ showDeriv: state.showDeriv });
+      view.deriv = this.checked;
+      plot.setData({ showDeriv: view.deriv });
       onCursor(plot.getCursorInfo());
-      changed(true);
     });
+    $("ep1Toggle").addEventListener("change", function () { view.ep1 = this.checked; plot.setData({ showEp1: view.ep1 }); });
+    $("ep2Toggle").addEventListener("change", function () { view.ep2 = this.checked; plot.setData({ showEp2: view.ep2 }); });
     $("resetZoomBtn").addEventListener("click", function () { plot.resetZoom(); });
 
     $("ep1Btn").addEventListener("click", function () { startSelect(1); });
@@ -468,14 +558,20 @@
     $("ep1Del").addEventListener("click", function () { deleteEp(1); });
     $("ep2Del").addEventListener("click", function () { deleteEp(2); });
     $("submitBtn").addEventListener("click", submit);
+    $("retryBtn").addEventListener("click", function () { saver.saveNow(); });
+    $("confirmOk").addEventListener("click", doSubmit);
+    $("confirmCancel").addEventListener("click", closeConfirm);
+    $("confirmDlg").addEventListener("click", function (e) { if (e.target === this) closeConfirm(); });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("confirmDlg").hidden) closeConfirm(); });
 
     $("switchUserBtn").addEventListener("click", function () {
-      if (saver.isDirty()) {
+      if (!state.submitConfirmed && saver.isDirty()) {
         window.alert("Még nem mentődött el minden a szerverre. Várd meg, amíg a felső sarokban a zöld „Mentve óó:pp” felirat megjelenik.");
         return;
       }
       if (!window.confirm("Új tanuló kezd ezen a telefonon? A(z) " + state.name +
         " nevű tanuló adatai a szerveren megmaradnak, de erről a telefonról többé nem szerkeszthetők.")) return;
+      clearTimeout(resultTimer);
       lsDel(LS_STATE);
       location.reload();
     });

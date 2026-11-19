@@ -47,6 +47,7 @@ function configScript(apiUrl, fast) {
     SAVE_DEBOUNCE_MS: ${fast ? 600 : 10000},
     SAVE_MIN_INTERVAL_MS: ${fast ? 1200 : 60000},
     SAVE_MAX_WAIT_MS: ${fast ? 5000 : 60000},
+    RESULT_POLL_MS: ${fast ? 1500 : 30000},
     REQUEST_TIMEOUT_MS: 8000 };`;
 }
 async function useConfig(ctx, apiUrl, fast = true) {
@@ -119,9 +120,36 @@ const readout = (page) => page.locator("#readout").innerText();
 const waitStatus = (page, prefix, timeout = 30000) =>
   page.waitForFunction((p) => { const t = document.getElementById("saveStatus").textContent; return p === "Mentve" ? /^Mentve \d\d:\d\d$/.test(t) : t.startsWith(p); }, prefix, { timeout });
 const readoutV = async (page) => {
-  const m = (await readout(page)).match(/V = ([\d,]+)/);
+  const m = (await readout(page)).match(/Vvalós = ([\d,]+)/);
   return m ? Number(m[1].replace(",", ".")) : null;
 };
+/* An immediate (urgent) save without submitting: (re)save the 1st equivalence point at the cursor. */
+async function urgentSave(page, x = 1) {
+  await page.evaluate((x) => { const p = document.getElementById("plot").__labPlot; if (!p.getCursorInfo()) p.setCursor(x); }, x);
+  await page.click("#ep1Btn");
+  await page.click("#epSaveBtn");
+}
+/* Save equivalence point n at volume x (cursor set directly, no touch needed – also for WebKit). */
+async function saveEpAt(page, n, x) {
+  await page.click(`#ep${n}Btn`);
+  await page.evaluate((x) => document.getElementById("plot").__labPlot.setCursor(x), x);
+  await page.click("#epSaveBtn");
+}
+/* Beküldés → confirmation dialog → Beküldés */
+async function submitConfirmed(page) {
+  await page.click("#submitBtn");
+  await page.locator("#confirmDlg").waitFor();
+  await page.click("#confirmOk");
+}
+const RESULT_RE = /^Az általad meghatározott ekvivalenciapont (\d+,\d)%-kal tér el a valós értéktől\.$/;
+
+async function setHiddenMain(page, hidden) {
+  await page.evaluate((h) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (h ? "hidden" : "visible") });
+    document.dispatchEvent(new Event("visibilitychange"));
+    if (h) window.dispatchEvent(new Event("pagehide"));
+  }, hidden);
+}
 
 /* ======================================================================= */
 const web = await startServer(8090);
@@ -168,6 +196,17 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     assert.equal(await page.getAttribute('input[data-f="i"]', "inputmode"), "decimal");
   });
 
+  await step("texts: no input hint under 'Mérési adatok'; headers Vvalós (subscript) and Meredekség; Beküldés needs both EPs", async () => {
+    const card = await page.locator("#dataCard").innerText();
+    assert.ok(!card.includes("Írd be a mért áramerősségeket") && !card.includes("Tizedesvessző és tizedespont is jó"), card.slice(0, 200));
+    assert.equal(await page.locator("#dataTable thead th").nth(1).evaluate((e) => e.innerHTML), "V<sub>valós</sub> / cm³");
+    assert.equal(await page.locator("#dataTable thead th").nth(3).innerText(), "Meredekség");
+    assert.equal(await page.locator("#submitBtn").isDisabled(), true);
+    assert.equal(await page.locator("#submitState").innerText(), "A beküldéshez előbb mentsd el mindkét ekvivalenciapontot.");
+    const html = await page.content();
+    for (const bad of ["V(NaOH)", "dĨ/dV", "erivált", "Újra beküldés"]) assert.ok(!html.includes(bad), bad);
+  });
+
   await step("typing currents (comma and point) fills the derivative column live", async () => {
     const ins = await page.$$('input[data-f="i"]');
     for (let k = 0; k < ins.length; k++) {
@@ -197,14 +236,43 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await shot(page, "03_portrait_full", true);
   });
 
-  await step("tap on the plot puts the cursor on the derivative curve", async () => {
+  await step("plot defaults: Meredekség hidden, both EP toggles on; the cursor reads Ĩ", async () => {
+    assert.equal(await page.locator("#derivToggle").isChecked(), false);
+    assert.equal(await page.locator("#ep1Toggle").isChecked(), true);
+    assert.equal(await page.locator("#ep2Toggle").isChecked(), true);
+    const labels = await page.locator(".plot-controls .switch").allInnerTexts();
+    assert.deepEqual(labels.map((l) => l.trim()), ["Meredekség megjelenítése", "1. EP megjelenítése", "2. EP megjelenítése"]);
+    assert.equal(await page.evaluate(() => document.getElementById("plot").__labPlot.showDeriv), false);
     await page.locator("#plotBox").scrollIntoViewIfNeeded();
+    const p = await plotPos(page, 12.3, 0, "L");
+    await t.tap(p.x, p.y - 40);
+    await sleep(80);
+    assert.match(await readout(page), /^Vvalós = [\d,]+ cm³\s*Ĩ = [\d,]+ mA$/);
+  });
+
+  await step("Meredekség on: the cursor snaps to the Meredekség line (no unit); drawn as a line, no points", async () => {
+    await page.click("label.switch:has(#derivToggle)");
+    assert.equal(await page.locator("#derivToggle").isChecked(), true);
     const p = await plotPos(page, 12.3, 0);
     await t.tap(p.x, p.y - 60); // y does not matter
     await sleep(80);
     const v = await readoutV(page);
     assert.ok(Math.abs(v - 12.3) < 0.15, "V = " + v);
-    assert.match(await readout(page), /dĨ\/dV = /);
+    assert.match(await readout(page), /Meredekség = [−\d,]+$/);
+    // line only: between two Meredekség points the line is drawn, but no dot sits on a point
+    const px = await page.evaluate(() => {
+      const cv = document.getElementById("plot"), pl = cv.__labPlot, d = pl.series.deriv[3];
+      pl.setCursor(null, false); pl.render(true);
+      const ctx = cv.getContext("2d"), dpr = pl.dpr;
+      const x = pl._X(d.x), y = pl._YR(d.y);
+      // 2,6 px above, below, left and right of the point: a 3,2 px dot would colour all four,
+      // a 1,8 px line at most the two along its own direction
+      const orange = (xx, yy) => { const [r, g, b] = ctx.getImageData(Math.round(xx * dpr), Math.round(yy * dpr), 1, 1).data; return r > 200 && g > 80 && g < 150 && b < 60; };
+      return { on: orange(x, y), around: [orange(x, y - 2.6), orange(x, y + 2.6), orange(x - 2.6, y), orange(x + 2.6, y)] };
+    });
+    assert.equal(px.on, true, "the Meredekség line passes through the point");
+    assert.ok(px.around.filter(Boolean).length <= 2, "no dot drawn on the point: " + JSON.stringify(px));
+    await t.tap(p.x, p.y - 60);
     await shot(page, "04_tap_cursor");
   });
 
@@ -245,7 +313,24 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     assert.equal(await page.locator("#resetZoomBtn").isVisible(), false);
   });
 
-  await step("EP1: select mode, drag to derivative = 0, save", async () => {
+  await step("EP1 button: resets the zoom and switches Meredekség on (even if the student zoomed and hid it)", async () => {
+    const c = await plotPos(page, 8, 0);
+    await t.pinch(c.x, c.y, 60, 220);
+    assert.equal(await page.locator("#resetZoomBtn").isVisible(), true);
+    await page.click("label.switch:has(#derivToggle)");
+    assert.equal(await page.locator("#derivToggle").isChecked(), false);
+    await page.click("#ep1Btn");
+    const pl = await page.evaluate(() => { const p = document.getElementById("plot").__labPlot; return { win: p.win, showDeriv: p.showDeriv }; });
+    assert.deepEqual(pl.win, { x0: 0, x1: 1, y0: 0, y1: 1 }, "full diagram");
+    assert.equal(pl.showDeriv, true);
+    assert.equal(await page.locator("#derivToggle").isChecked(), true);
+    assert.equal(await page.locator("#resetZoomBtn").isVisible(), false);
+    assert.equal(await page.locator("#epSelectText").innerText(),
+      "1. ekvivalenciapont kijelölése. Érintsd meg a grafikont és a piros jelölőt az ujjaddal húzva keresd meg, ahol a Meredekség = 0, majd nyomd meg a Mentés gombot.");
+    await page.click("#epCancelBtn");
+  });
+
+  await step("EP1: select mode, drag to Meredekség = 0, save", async () => {
     await page.click("#ep1Btn");
     assert.equal(await page.locator("#epSelect").isVisible(), true);
     assert.equal(await page.locator("#epSaveBtn").isEnabled(), true); // cursor exists already
@@ -259,13 +344,15 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await shot(page, "07_ep1_selecting");
     await page.click("#epSaveBtn");
     const txt = await page.locator("#ep1Val").innerText();
-    assert.match(txt, /V = [\d,]+ cm³/);
+    assert.match(txt, /^Vvalós = [\d,]+ cm³\s+Meredekség = [−\d,]+$/);
     const ep1 = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_state")).ep1);
     assert.ok(Math.abs(ep1.v - x0) < 0.1 && Math.abs(ep1.d) < 0.15, JSON.stringify(ep1));
   });
 
-  await step("EP2: maximum of the derivative, save; both markers shown", async () => {
+  await step("EP2: maximum of the Meredekség, save; both markers shown", async () => {
     await page.click("#ep2Btn");
+    assert.equal(await page.locator("#epSelectText").innerText(),
+      "2. ekvivalenciapont kijelölése. Érintsd meg a grafikont és a piros jelölőt az ujjaddal húzva keresd meg a Meredekség maximumát, majd nyomd meg a Mentés gombot.");
     const xm = await page.evaluate(() => {
       const s = window.LabCore.buildSeries(JSON.parse(localStorage.getItem("oxalsav_state")).rows).deriv;
       return s.reduce((a, b) => (b.y > a.y ? b : a)).x;
@@ -275,8 +362,24 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await page.click("#epSaveBtn");
     const st = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_state")));
     assert.ok(Math.abs(st.ep2.v - xm) < 0.1);
-    await page.locator("#plotCard").scrollIntoViewIfNeeded();
+    await showBelowTopbar(page, "plotCard");
     await shot(page, "08_both_eps");
+  });
+
+  await step("'1. EP / 2. EP megjelenítése' only show or hide that marker", async () => {
+    const eps = () => page.evaluate(() => { const p = document.getElementById("plot").__labPlot; return { show: p.showEp, ep1: !!p.eps.ep1, ep2: !!p.eps.ep2 }; });
+    await page.click("label.switch:has(#ep1Toggle)");
+    assert.deepEqual(await eps(), { show: { ep1: false, ep2: true }, ep1: true, ep2: true });
+    await showBelowTopbar(page, "plotCard");
+    await shot(page, "08b_ep1_marker_hidden");
+    await page.click("label.switch:has(#ep2Toggle)");
+    assert.deepEqual(await eps(), { show: { ep1: false, ep2: false }, ep1: true, ep2: true });
+    const st = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_state")));
+    assert.ok(st.ep1 && st.ep2, "the saved points are untouched");
+    assert.match(await page.locator("#ep1Val").innerText(), /Vvalós = /);
+    await page.click("label.switch:has(#ep1Toggle)");
+    await page.click("label.switch:has(#ep2Toggle)");
+    assert.deepEqual((await eps()).show, { ep1: true, ep2: true });
   });
 
   await step("hiding the derivative: cursor snaps to the current curve", async () => {
@@ -309,30 +412,6 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     assert.equal(await page.locator("#sortHint").isVisible(), false);
   });
 
-  await step("submit → server row says submitted, with EP values", async () => {
-    await page.click("#submitBtn");
-    await page.waitForFunction(() => document.getElementById("submitState").classList.contains("ok"), null, { timeout: 8000 });
-    await page.locator("#submitCard").scrollIntoViewIfNeeded();
-    await shot(page, "11_submitted");
-    const s = fake.gas.post({ action: "list", password: "titok" }).students[0];
-    assert.equal(s.submitted, true);
-    assert.equal(typeof s.ep1v, "number");
-    assert.equal(typeof s.ep2v, "number");
-    assert.equal(s.points, 22);
-  });
-
-  await step("editing after submit → 'küldd be újra' + server flag", async () => {
-    await page.locator('input[data-f="i"]').nth(0).fill("30,5");
-    assert.match(await page.locator("#submitState").innerText(), /Küldd be újra/);
-    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 8000 });
-    await sleep(1500);
-    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 8000 });
-    const s = fake.gas.post({ action: "list", password: "titok" }).students[0];
-    assert.equal(s.changedAfterSubmit, true);
-    await page.click("#submitBtn");
-    await page.waitForFunction(() => document.getElementById("submitState").classList.contains("ok"), null, { timeout: 8000 });
-  });
-
   await step("server only busy → 'Küldés…' (not 'Hiba') for the first 2 retries, then saved", async () => {
     const statuses = new Set();
     await page.exposeFunction("__statusSeen", (t) => statuses.add(t)).catch(() => {});
@@ -340,7 +419,7 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
       .observe(document.getElementById("saveStatus"), { childList: true, characterData: true, subtree: true }));
     fake.log.busyNext = 2;
     await page.locator('input[data-f="i"]').nth(2).fill("24,9");
-    await page.click("#submitBtn");                 // immediate save → busy, busy, ok
+    await urgentSave(page);                         // immediate save → busy, busy, ok
     await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 30000 });
     assert.ok(![...statuses].some((t) => t.startsWith("Hiba")), "never showed Hiba: " + [...statuses].join(" | "));
     assert.ok([...statuses].includes("Küldés…"));
@@ -350,11 +429,11 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
   await step("server busy 3 times in a row → 'Hiba – újrapróbálás' from the 3rd failure, then saved", async () => {
     fake.log.busyNext = 3;
     await page.locator('input[data-f="i"]').nth(2).fill("25,1");
-    await page.click("#submitBtn");
+    await urgentSave(page);
     await page.waitForFunction(() => document.getElementById("saveStatus").textContent === "Hiba – újrapróbálás", null, { timeout: 30000 });
     await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 45000 });
     await page.locator('input[data-f="i"]').nth(2).fill("25,5");
-    await page.click("#submitBtn");
+    await urgentSave(page);
     await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 15000 });
   });
 
@@ -376,9 +455,113 @@ console.log("\nStudent – iPhone 13 portrait, backend = Code.gs behind a fake A
     await page.reload();
     await page.locator("#app").waitFor();
     assert.equal(await page.locator('input[data-f="i"]').nth(1).inputValue(), "27,4");
-    assert.match(await page.locator("#ep1Val").innerText(), /V = /);
-    assert.match(await page.locator("#ep2Val").innerText(), /V = /);
+    assert.match(await page.locator("#ep1Val").innerText(), /Vvalós = /);
+    assert.match(await page.locator("#ep2Val").innerText(), /Vvalós = /);
+    assert.equal(await page.locator("#derivToggle").isChecked(), false, "every page open starts with Meredekség hidden");
     savedState = JSON.parse(before);
+  });
+
+  const KEY = () => fake.gas.post({ action: "list", password: "titok" }).students.find((x) => x.name === "Kiss Anna" && x.deviceId === savedState.deviceId).key;
+  const savesNow = () => fake.log.requests.filter((r) => r.action === "save" && r.state && r.state.deviceId === savedState.deviceId).length;
+
+  await step("Beküldés → confirmation dialog; 'Mégse' sends nothing and changes nothing", async () => {
+    await page.waitForFunction(() => /^Mentve \d\d:\d\d$/.test(document.getElementById("saveStatus").textContent), null, { timeout: 15000 });
+    assert.equal(await page.locator("#submitBtn").isEnabled(), true);
+    const n = savesNow();
+    await page.click("#submitBtn");
+    await page.locator("#confirmDlg").waitFor();
+    assert.equal(await page.locator("#confirmText").innerText(), "Biztosan beküldöd? A beküldés végleges, utána már nem módosíthatod az adatokat.");
+    assert.deepEqual(await page.locator("#confirmDlg button").allInnerTexts(), ["Beküldés", "Mégse"]);
+    await shot(page, "11_confirm_dialog");
+    await page.click("#confirmCancel");
+    assert.equal(await page.locator("#confirmDlg").isVisible(), false);
+    await sleep(1500);
+    assert.equal(savesNow(), n, "nothing sent");
+    const st = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_state")));
+    assert.equal(st.submitted, false);
+    assert.equal(await page.locator('input[data-f="i"]').first().isEditable(), true, "still editable");
+  });
+
+  await step("Beküldés fails → error + 'Újrapróbálás', editing locked, nothing lost; retry → results screen only after the server confirmed", async () => {
+    fake.log.failing = true;
+    await submitConfirmed(page);
+    await page.waitForFunction(() => document.getElementById("submitState").textContent.startsWith("Nem sikerült beküldeni"), null, { timeout: 10000 });
+    assert.equal(await page.locator("#retryBtn").isVisible(), true);
+    assert.equal(await page.locator("#resultCard").isVisible(), false, "no results before the server confirmed");
+    assert.equal(await page.locator('input[data-f="i"]').first().isEditable(), false, "table locked");
+    for (const id of ["#addRowBtn", "#ep1Btn", "#ep2Btn"]) assert.equal(await page.locator(id).isDisabled(), true, id);
+    assert.equal(await page.locator("#submitBtn").isVisible(), false);
+    const st = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_state")));
+    assert.equal(st.submitted, true);
+    assert.equal(st.rows[1].i, "27,4", "data still on the phone");
+    await page.locator("#submitCard").scrollIntoViewIfNeeded();
+    await shot(page, "11b_submit_failed_retry");
+    fake.log.failing = false;
+    await page.click("#retryBtn");
+    await page.locator("#resultCard").waitFor({ timeout: 10000 });
+    for (const id of ["#dataCard", "#plotCard", "#submitCard"]) assert.equal(await page.locator(id).isVisible(), false, id);
+    assert.equal(await page.locator("#resultText").innerText(), "Sikeres beküldés. Az eredményed hamarosan megjelenik ezen az oldalon.");
+    await shot(page, "11c_results_pending");
+    const s = fake.gas.post({ action: "list", password: "titok" }).students.find((x) => x.key === KEY());
+    assert.equal(s.submitted, true);
+    assert.equal(typeof s.ep1v, "number");
+    assert.equal(typeof s.ep2v, "number");
+    assert.equal(s.points, 22);
+  });
+
+  await step("results: the teacher enters the true value → the student sees only the percentage (checked again automatically)", async () => {
+    await sleep(2000);
+    const polls = fake.log.requests.filter((r) => r.action === "result").length;
+    assert.ok(polls >= 2, "polling while the true value is missing (" + polls + " requests)");
+    fake.gas.post({ action: "setTrue", password: "titok", value: "16,5" });
+    await page.waitForFunction((re) => new RegExp(re).test(document.getElementById("resultText").textContent), RESULT_RE.source, { timeout: 8000 });
+    const s = fake.gas.post({ action: "list", password: "titok" }).students.find((x) => x.key === KEY());
+    const shown = (await page.locator("#resultText").innerText()).match(RESULT_RE)[1];
+    assert.equal(shown, s.relErr.toFixed(1).replace(".", ","), "same value as on the teacher page");
+    const exp = Math.round(Math.abs(Number(s.ep2v.toFixed(2)) - 16.5) / 16.5 * 1000) / 10;
+    assert.equal(s.relErr, exp);
+    for (const r of fake.log.requests.filter((r) => r.action === "result")) {
+      assert.ok(!("trueValue" in r.result) && !JSON.stringify(r.result).includes("16.5"), "the true value never reaches the student: " + JSON.stringify(r.result));
+    }
+    const n = fake.log.requests.filter((r) => r.action === "result").length;
+    await sleep(3500);
+    assert.equal(fake.log.requests.filter((r) => r.action === "result").length, n, "polling stops once the result is shown");
+    await shot(page, "11d_results");
+  });
+
+  await step("results screen persists after a reload; autosave stopped, no editing, no 'Újra beküldés'", async () => {
+    const n = savesNow();
+    const text = await page.locator("#resultText").innerText();
+    await page.reload();
+    await page.locator("#resultCard").waitFor();
+    assert.equal(await page.locator("#resultText").innerText(), text);
+    for (const id of ["#dataCard", "#plotCard", "#submitCard"]) assert.equal(await page.locator(id).isVisible(), false, id);
+    assert.equal(await page.locator("#switchUserBtn").isVisible(), true, "'Másik tanuló ezen a telefonon' reachable");
+    assert.ok(!(await page.content()).includes("Újra beküldés"));
+    await setHiddenMain(page, true); await setHiddenMain(page, false);
+    await sleep(2500);
+    assert.equal(savesNow(), n, "no save after the confirmed submission (also not on hide / reload)");
+  });
+
+  await step("server: a later save for the submitted student does not change what the teacher sees", async () => {
+    const before = fake.gas.post({ action: "get", password: "titok", key: KEY() }).student;
+    const late = JSON.parse(JSON.stringify(before.state));
+    late.rows[0].i = "99,9"; late.ep2.v = 3.21;
+    const r = fake.gas.post({ action: "save", key: KEY(), rev: before.rev + 100, state: late });
+    assert.equal(r.ok, true);
+    const after = fake.gas.post({ action: "get", password: "titok", key: KEY() }).student;
+    assert.equal(after.rev, before.rev);
+    assert.equal(after.ep2v, before.ep2v);
+    assert.equal(after.state.rows[0].i, before.state.rows[0].i);
+    assert.equal(after.relErr, before.relErr);
+  });
+
+  await step("'Másik tanuló ezen a telefonon' on the results screen starts a fresh student", async () => {
+    page.once("dialog", (d) => d.accept());
+    await page.click("#switchUserBtn");
+    await page.locator("#startScreen").waitFor();
+    assert.equal(await page.locator("#nameInput").inputValue(), "");
+    assert.equal(await page.evaluate(() => localStorage.getItem("oxalsav_state")), null);
   });
 
   await step("no CORS preflight, text/plain only, no console errors", async () => {
@@ -493,41 +676,41 @@ console.log("\nStatus chip – every state on an iPhone SE (375×667), portrait 
       await waitStatus(page, "Mentve");
       ratios.saved = await check("4_confirmed", /^Mentve \d\d:\d\d$/, "saved", 4.5);
       // 1) waiting for the next autosave: data is on the phone
-      await inp(0).fill("17,27");
+      for (const [k, v] of [[0, "17,27"], [1, "17,30"], [2, "17,26"]]) await inp(k).fill(v);
       ratios.local = await check("1_waiting", "Mentve a telefonon", "local", 7);
-      // 2) actually sending (the server holds the request 4 s)
+      // 2) actually sending (the server holds the request 4 s); EP Mentés saves at once
       fake.log.delayNext = 4000;
-      await page.click("#submitBtn");
+      await urgentSave(page);
       await page.waitForFunction(() => document.getElementById("saveStatus").textContent === "Küldés…");
       ratios.sending = await check("2_sending", "Küldés…", "sending", 7);
       await waitStatus(page, "Mentve");
       // 3) the server is only busy → still "Küldés…" while the app waits to retry
       fake.log.busyNext = 1;
-      await inp(1).fill("17,28");
-      await page.click("#submitBtn");
+      await inp(3).fill("17,28");
+      await urgentSave(page);
       for (let k = 0; k < 100 && fake.log.busyNext > 0; k++) await sleep(50);
       await sleep(400);
       await check("3_busy_retry", "Küldés…", "sending", 7);
       await waitStatus(page, "Mentve");
       // 5) server error
       fake.log.failing = true;
-      await inp(2).fill("17,27");
-      await page.click("#submitBtn");
+      await inp(4).fill("17,27");
+      await urgentSave(page);
       await waitStatus(page, "Hiba");
       ratios.error = await check("5_error", "Hiba – újrapróbálás", "error", 4.5);
       fake.log.failing = false;
       await waitStatus(page, "Mentve", 30000);
       // 6) offline
       await ctx.setOffline(true);
-      await inp(3).fill("17,25");
-      await page.click("#submitBtn");
+      await inp(5).fill("17,25");
+      await urgentSave(page);
       await waitStatus(page, "Nincs internet");
       await check("6_offline", "Nincs internet – újrapróbálás", "error", 4.5);
       await ctx.setOffline(false);
       await waitStatus(page, "Mentve", 30000);
       // 7) the phone cannot store the data → never claim "Mentve a telefonon"
       await page.evaluate(() => { window.__origSet = Storage.prototype.setItem; Storage.prototype.setItem = function () { throw new Error("QuotaExceededError"); }; });
-      await inp(4).fill("17,22");
+      await inp(6).fill("17,22");
       await check("7_storage", "Hiba – a telefon tárhelye megtelt", "error", 4.5);
       await page.evaluate(() => { Storage.prototype.setItem = window.__origSet; });
       console.log(`      (contrast: waiting ${ratios.local.toFixed(1)}:1, sending ${ratios.sending.toFixed(1)}:1, confirmed ${ratios.saved.toFixed(1)}:1, error ${ratios.error.toFixed(1)}:1)`);
@@ -593,12 +776,33 @@ console.log("\nStudent – mock mode (no server)");
     const db = await page.evaluate(() => JSON.parse(localStorage.getItem("oxalsav_mock_db")));
     assert.equal(Object.values(db)[0].name, "Mock Mária");
   });
+  await step("real config: the 38 preset volumes are shown with decimal commas", async () => {
+    const vs = await page.$$eval('input[data-f="v"]', (els) => els.map((e) => e.value));
+    assert.deepEqual(vs, ["0", "1", "2", "3", "4", "5", "6", "7", "8", "8,5", "9", "9,5", "10", "10,5", "11", "11,5", "12", "12,5", "13",
+      "13,5", "14", "15", "16", "17", "17,5", "18", "18,5", "19", "19,5", "20", "20,5", "21", "21,5", "22", "22,5", "23", "24", "25"]);
+  });
+  await step("mock: submit-once flow and result with a true value", async () => {
+    const data = loadTsv("real-oxalic-acid.tsv");
+    const byV = Object.fromEntries(data.map((r) => [r.v.replace(/,00$/, "").replace(/,50$/, ",5"), r.i]));
+    const vs = await page.$$eval('input[data-f="v"]', (els) => els.map((e) => e.value));
+    for (let k = 0; k < vs.length; k++) if (byV[vs[k]]) await page.locator('input[data-f="i"]').nth(k).fill(byV[vs[k]]);
+    await saveEpAt(page, 1, 12);
+    await saveEpAt(page, 2, 24);
+    await submitConfirmed(page);
+    await page.locator("#resultCard").waitFor({ timeout: 8000 });
+    assert.match(await page.locator("#resultText").innerText(), /hamarosan/);
+  });
   await step("mock teacher page (password: tanar) sees the mock student", async () => {
     await page.goto(WEB + "/teacher.html?mock=1&delay=50");
     await page.fill("#pwInput", "tanar");
     await page.click("#loginBtn");
     await page.locator("#listBody tr").first().waitFor();
     assert.match(await page.locator("#listBody").innerText(), /Mock Mária/);
+    await page.fill("#trueInput", "24,5");
+    await page.click("#trueSaveBtn");
+    await page.waitForFunction(() => document.getElementById("trueCurrent").textContent.includes("24,50 cm³"));
+    await page.waitForFunction(() => /\d,\d/.test(document.querySelector("#listBody tr td:nth-child(6)").textContent));
+    assert.equal(await page.locator("#listBody tr td").nth(5).innerText(), "2,0"); // |24,00 − 24,5| / 24,5 = 2,04 %
   });
   await ctx.close();
 }
@@ -611,7 +815,7 @@ console.log("\nTeacher page");
     const dev = "teacherdev" + k;
     const rows = Array.from({ length: 21 }, (_, v) => ({ id: "r" + v, v: String(v), i: String(current(v) + (k - 1) * 0.4).replace(".", ",") }));
     fake.gas.post({ action: "save", key: dev + "|" + n, rev: 1, state: {
-      name: n, deviceId: dev, rows, showDeriv: true,
+      name: n, deviceId: dev, rows,
       ep1: k === 2 ? null : { v: 8 + k * 0.1, d: 0.01, i: 9 }, ep2: k === 2 ? null : { v: 16.4 + k * 0.1, d: 3.3, i: 15 },
       submitted: k !== 2, submittedAt: new Date().toISOString(), changedAfterSubmit: false } });
   });
@@ -632,6 +836,35 @@ console.log("\nTeacher page");
       await page.locator("#listBody tr").first().waitFor();
       assert.equal(await page.locator("#listBody tr").count(), fake.gas.post({ action: "list", password: "titok" }).students.length);
     });
+    await step(`teacher (${suffix}): true value field (decimal comma), current value shown, relative error column`, async () => {
+      if (suffix === "desktop") {
+        fake.gas.post({ action: "setTrue", password: "titok", value: "" });
+        await page.click("#refreshBtn");
+        await page.waitForFunction(() => document.getElementById("trueCurrent").textContent.includes("még nincs megadva"));
+        await page.fill("#trueInput", "abc");
+        await page.click("#trueSaveBtn");
+        assert.match(await page.locator("#trueError").innerText(), /pozitív számot/);
+        assert.equal(fake.gas.props.TRUE_VALUE_EP2, undefined, "nothing stored");
+        await page.fill("#trueInput", "16,5");
+        await page.click("#trueSaveBtn");
+        await page.waitForFunction(() => document.getElementById("trueCurrent").textContent.includes("16,50 cm³"));
+        assert.equal(fake.gas.props.TRUE_VALUE_EP2, "16.5", "stored on the server (Script properties)");
+      }
+      assert.match(await page.locator("#trueCurrent").innerText(), /Jelenleg: 16,50 cm³/);
+      const head = await page.locator("#listTable thead").innerText();
+      assert.match(head, /Rel\. hiba \/ %/);
+      const srv = fake.gas.post({ action: "list", password: "titok" }).students;
+      await page.waitForFunction(() => /\d,\d/.test(document.getElementById("listBody").innerText));
+      const rows = await page.$$eval("#listBody tr", (trs) => trs.map((tr) => [tr.dataset.key, tr.cells[5].textContent, tr.cells[2].textContent]));
+      for (const [key, err, sub] of rows) {
+        const s = srv.find((x) => x.key === key);
+        assert.equal(err, typeof s.relErr === "number" ? s.relErr.toFixed(1).replace(".", ",") : "–", s.name);
+        assert.ok(!sub.includes("*"), "no 'igen*' mark any more");
+      }
+      assert.ok(!(await page.locator("#stats").innerText()).includes("*"));
+      await page.locator("#trueCard").scrollIntoViewIfNeeded();
+      await shot(page, "23_teacher_true_value_" + suffix);
+    });
     await step(`teacher (${suffix}): sorting and search`, async () => {
       await page.click('th[data-sort="name"]'); // toggles to descending
       const first = await page.locator("#listBody tr td").first().innerText();
@@ -649,10 +882,15 @@ console.log("\nTeacher page");
       await page.locator("#detailView").waitFor();
       assert.equal(await page.locator("#dBody input").count(), 0, "read-only");
       assert.ok((await page.locator("#dBody tr").count()) >= 21);
-      assert.match(await page.locator("#dEp1").innerText(), /V = /);
+      assert.match(await page.locator("#dEp1").innerText(), /^Vvalós = [\d,]+ cm³\s+Meredekség = [−\d,]+\s+Ĩ = /);
+      assert.match(await page.locator("#dMeta").innerText(), /Relatív hiba: \d+,\d %/);
+      for (const id of ["#dDerivToggle", "#dEp1Toggle", "#dEp2Toggle"]) assert.equal(await page.locator(id).isChecked(), true, id + " on for the teacher");
       const p = await plotPos(page, 12, 0);
       await page.mouse.click(p.x, p.y);
-      assert.match(await page.locator("#dReadout").innerText(), /V = 12/);
+      assert.match(await page.locator("#dReadout").innerText(), /^Vvalós = 12,\d\d cm³\s*Meredekség = [−\d,]+$/);
+      await page.click("label.switch:has(#dEp2Toggle)");
+      assert.equal(await page.evaluate(() => document.getElementById("dPlot").__labPlot.showEp.ep2), false);
+      await page.click("label.switch:has(#dEp2Toggle)");
       await shot(page, "22_teacher_detail_" + suffix, suffix === "mobile");
       await page.click("#backBtn");
       await page.locator("#listView").waitFor();
@@ -663,8 +901,11 @@ console.log("\nTeacher page");
         const bytes1 = await readFile(await d1.path());
         assert.deepEqual([...bytes1.subarray(0, 3)], [0xef, 0xbb, 0xbf], "UTF-8 BOM for Excel");
         const csv1 = bytes1.toString("utf8");
-        assert.ok(csv1.includes(";1. EP dĨ/dV / (mA/cm³);"), "summary header uses dĨ/dV");
-        assert.ok(csv1.startsWith("﻿Név;Eszköz;Utolsó mentés;Beküldve"), csv1.slice(0, 80));
+        assert.ok(csv1.startsWith("﻿Név;Eszköz;Utolsó mentés;Beküldve;Beküldés ideje;1. EP Vvalós / cm3;1. EP Meredekség;2. EP Vvalós / cm3;2. EP Meredekség;Relatív hiba (%);Mérési pontok\r\n"), csv1.slice(0, 200));
+        assert.ok(!csv1.includes("módosítva"));
+        const kiss = csv1.split("\r\n").find((l) => l.startsWith("Kiss Anna;teacherdev3"));
+        const s3 = fake.gas.post({ action: "list", password: "titok" }).students.find((x) => x.deviceId === "teacherdev3");
+        assert.equal(kiss.split(";")[9], s3.relErr.toFixed(1).replace(".", ","), "relative error column");
         assert.equal(csv1.split("\r\n").length, fake.gas.post({ action: "list", password: "titok" }).students.length + 1, "header + one line per student");
         assert.match(csv1, /Kiss Anna;[a-z0-9]+;[\d-]+ [\d:]+;igen/);
         const [d2] = await Promise.all([page.waitForEvent("download"), page.click("#csvAllBtn")]);
@@ -672,9 +913,9 @@ console.log("\nTeacher page");
         assert.deepEqual([...bytes2.subarray(0, 3)], [0xef, 0xbb, 0xbf], "UTF-8 BOM for Excel");
         assert.ok(bytes2.includes(Buffer.from([0xc4, 0xa8])), "Ĩ (U+0128) encoded as UTF-8 C4 A8");
         const csv2 = bytes2.toString("utf8");
-        assert.ok(csv2.includes("Név;Eszköz;Sor;V(NaOH) (cm3);Ĩ / mA;dĨ/dV / (mA/cm³)"));
+        assert.ok(csv2.includes("Név;Eszköz;Sor;Vvalós / cm3;Ĩ / mA;Meredekség;Relatív hiba (%)\r\n"));
         assert.ok(csv2.split("\r\n").length > 100);
-        assert.match(csv2, /;\d+,\d{3};\d+,\d{4};-?\d+,\d{6}/);
+        assert.match(csv2, /;\d+,\d{3};\d+,\d{4};-?\d+,\d{6};\d+,\d\r\n/);
       });
     }
     await ctx.close();
@@ -726,19 +967,6 @@ console.log("\nSave guarantees – production timing (10 s debounce, 60 s min in
     await waitStatus(page, "Mentve");
   });
 
-  await step("a) Beküldés right after an edit (inside the 60 s window) is saved at once", async () => {
-    const n = savesOf(NAME).length;
-    await inp(0).fill("31,1");
-    await page.click("#submitBtn");
-    const dt = await waitSaves(NAME, n + 1, 2000);
-    const last = savesOf(NAME).at(-1);
-    assert.equal(last.state.submitted, true);
-    assert.equal(last.state.rows[0].i, "31,1");
-    await waitStatus(page, "Mentve");
-    assert.equal(serverStudent(NAME).submitted, true);
-    console.log(`      (request sent ${dt} ms after the click)`);
-  });
-
   await step("b) EP 'Mentés' is saved at once (both points)", async () => {
     for (const n of [1, 2]) {
       const before = savesOf(NAME).length;
@@ -768,7 +996,7 @@ console.log("\nSave guarantees – production timing (10 s debounce, 60 s min in
     const n = savesOf(NAME).length;
     fake.log.delayNext = 2500;
     await inp(9).fill("13,3");
-    await page.click("#submitBtn");                 // request A, held 2.5 s by the server
+    await urgentSave(page);                         // request A (EP Mentés), held 2.5 s by the server
     await waitSaves(NAME, n + 1, 2000);
     await page.click("#ep1Del");                    // urgent while A is in flight
     await waitSaves(NAME, n + 2, 6000);
@@ -780,14 +1008,22 @@ console.log("\nSave guarantees – production timing (10 s debounce, 60 s min in
     assert.equal(serverStudent(NAME).ep1v, null);
   });
 
-  await step("a) Beküldés while another save is still in flight → sent right after it", async () => {
+  await step("setup: both EPs saved again", async () => {
+    await saveEpAt(page, 1, 8);
+    await saveEpAt(page, 2, 16.5);
+    await waitStatus(page, "Mentve");
+    const st = serverStudent(NAME);
+    assert.ok(typeof st.ep1v === "number" && typeof st.ep2v === "number");
+  });
+
+  await step("a) an immediate save while another save is still in flight → sent right after it", async () => {
     const n = savesOf(NAME).length;
     fake.log.delayNext = 2500;
     await inp(1).fill("27,7");
-    await page.click("#submitBtn");                 // request A, held 2.5 s by the server
+    await urgentSave(page);                         // request A, held 2.5 s by the server
     await waitSaves(NAME, n + 1, 2000);
     await inp(2).fill("25,5");
-    await page.click("#submitBtn");                 // urgent again while A is in flight
+    await saveEpAt(page, 2, 16.5);                  // urgent again while A is in flight
     await waitSaves(NAME, n + 2, 6000);
     const [a, b] = savesOf(NAME).slice(-2);
     await waitStatus(page, "Mentve");
@@ -819,7 +1055,7 @@ console.log("\nSave guarantees – production timing (10 s debounce, 60 s min in
     const n = savesOf(NAME).length;
     fake.log.delayNext = 3000;
     await inp(4).fill("22,2");
-    await page.click("#submitBtn");                 // request A (older rev) held 3 s
+    await urgentSave(page);                         // request A (older rev) held 3 s
     await waitSaves(NAME, n + 1, 2000);
     await inp(5).fill("23,3");
     await setHidden(page, true);                    // beacon B (newer rev) overtakes A
@@ -859,6 +1095,24 @@ console.log("\nSave guarantees – production timing (10 s debounce, 60 s min in
     await sleep(200);
     assert.equal(serverStudent(NAME).state.rows[7].i, "25,7");
   });
+
+  await step("a) Beküldés right after an edit (inside the 60 s window) is saved at once, after the confirmation", async () => {
+    const page2 = await ctx.newPage();               // the student opens the page again
+    await page2.goto(WEB + "/index.html");
+    await page2.locator("#app").waitFor();
+    await waitStatus(page2, "Mentve", 30000);        // the save after reopening
+    const n = savesOf(NAME).length;
+    await page2.locator('input[data-f="i"]').nth(0).fill("31,1");
+    await submitConfirmed(page2);
+    const dt = await waitSaves(NAME, n + 1, 2000);
+    const last = savesOf(NAME).at(-1);
+    assert.equal(last.state.submitted, true);
+    assert.equal(last.state.rows[0].i, "31,1");
+    await page2.locator("#resultCard").waitFor({ timeout: 8000 });
+    assert.equal(serverStudent(NAME).submitted, true);
+    assert.equal(serverStudent(NAME).state.rows[0].i, "31,1");
+    console.log(`      (request sent ${dt} ms after the confirmation)`);
+  });
   await ctx.close();
 }
 
@@ -886,14 +1140,6 @@ console.log("\nSave guarantees – WebKit (Safari engine) with iPhone 13 emulati
       assert.equal(serverStudent(NAME).state.rows[0].i, "30,3");
       await setHidden(page, false);
     });
-    await step("WebKit: Beküldés inside the 60 s window → saved at once", async () => {
-      page.on("dialog", (d) => d.accept());
-      const n = savesOf(NAME).length;
-      await inp(1).fill("28,8");
-      await page.click("#submitBtn");
-      await waitSaves(NAME, n + 1, 2000);
-      assert.equal(savesOf(NAME).at(-1).state.submitted, true);
-    });
     // Playwright's WebKit does not run unload handlers on page.close(), so leave the page instead
     // (fires pagehide exactly like closing/leaving the tab does in Safari).
     await step("WebKit: leaving the page right after an edit (pagehide) → the edit reaches the server", async () => {
@@ -903,6 +1149,20 @@ console.log("\nSave guarantees – WebKit (Safari engine) with iPhone 13 emulati
       await waitSaves(NAME, n + 1, 2000);
       await sleep(200);
       assert.equal(serverStudent(NAME).state.rows[2].i, "26,6");
+    });
+    await step("WebKit: Beküldés inside the 60 s window → saved at once (after the confirmation)", async () => {
+      await page.goto(WEB + "/index.html");
+      await page.locator("#app").waitFor();
+      await inp(1).fill("28,8");
+      await saveEpAt(page, 1, 1);
+      await saveEpAt(page, 2, 1.5);
+      await waitStatus(page, "Mentve");
+      const n = savesOf(NAME).length;
+      await inp(3).fill("27,1");
+      await submitConfirmed(page);
+      await waitSaves(NAME, n + 1, 2000);
+      assert.equal(savesOf(NAME).at(-1).state.submitted, true);
+      await page.locator("#resultCard").waitFor({ timeout: 8000 });
     });
     await ctx.close();
     await wk.close();
@@ -976,7 +1236,7 @@ for (const [dev, label] of [
     const yMid = (Math.max(g.cTop, g.top) + Math.min(g.cBottom, g.H)) / 2;
     await touchDrag(200, yMid, yMid - 120);
     assert.equal((await geom()).scrollY, g.scrollY, "page did not scroll");
-    assert.match(await readout(page), /V = [\d,]+ cm³/, "the cursor moved instead");
+    assert.match(await readout(page), /Vvalós = [\d,]+ cm³/, "the cursor moved instead");
     await page.evaluate(() => window.scrollTo(0, 0));
   });
   await step(label + ": swiping outside the plot reaches table, EP buttons and Beküldés, top to bottom and back", async () => {
@@ -1049,7 +1309,7 @@ console.log("\nReal measurement (tests/fixtures/real-oxalic-acid.tsv) – studen
     const h = await home();
     assert.ok(Math.abs(h.yL.min - 16.772) < 1e-9 && Math.abs(h.yL.max - 18.068) < 1e-9, JSON.stringify(h.yL));
     assert.equal(h.x.min, 0, "volume axis still starts at 0");
-    assert.ok(h.yR.min < 0 && h.yR.max > 0.12, "derivative axis unchanged (negative range included)");
+    assert.ok(h.yR.min < 0 && h.yR.max > 0.12, "Meredekség axis unchanged (negative range included)");
     await page.locator("#plotBox").scrollIntoViewIfNeeded();
     const c = await plotPos(page, 15, 0);
     await t.pinch(c.x, c.y, 80, 220, 8, 1);         // diagonal pinch: zooms both axes
@@ -1078,7 +1338,7 @@ console.log("\nReal measurement (tests/fixtures/real-oxalic-acid.tsv) – studen
     await shot(page, "30_real_student_plot_derivative");
   });
 
-  await step("real data: plot without the derivative (cursor on the Ĩ curve)", async () => {
+  await step("real data: plot without the Meredekség (cursor on the Ĩ curve)", async () => {
     await page.click(".switch");
     const p = await plotPos(page, 12, 0);
     await t.tap(p.x, p.y);
@@ -1093,8 +1353,6 @@ console.log("\nReal measurement (tests/fixtures/real-oxalic-acid.tsv) – studen
   });
 
   await step("real data: Beküldés", async () => {
-    await page.click("#submitBtn");
-    await page.waitForFunction(() => document.getElementById("submitState").classList.contains("ok"), null, { timeout: 8000 });
     studentView = await page.evaluate(() => ({
       rows: [...document.querySelectorAll("#dataBody tr")].map((tr) => [tr.querySelector('[data-f="v"]').value, tr.querySelector('[data-f="i"]').value, tr.querySelector("output").textContent]),
       series: document.getElementById("plot").__labPlot.series,
@@ -1102,6 +1360,10 @@ console.log("\nReal measurement (tests/fixtures/real-oxalic-acid.tsv) – studen
       eps: document.getElementById("plot").__labPlot.eps,
       ep1: document.getElementById("ep1Val").innerText, ep2: document.getElementById("ep2Val").innerText
     }));
+    await submitConfirmed(page);
+    await page.locator("#resultCard").waitFor({ timeout: 8000 });
+    await page.waitForFunction((re) => new RegExp(re).test(document.getElementById("resultText").textContent), RESULT_RE.source, { timeout: 8000 });
+    await shot(page, "34_real_student_result");
   });
   await ctx.close();
 
@@ -1127,11 +1389,12 @@ console.log("\nReal measurement (tests/fixtures/real-oxalic-acid.tsv) – studen
     assert.deepEqual(tv.home, studentView.home, "same automatic axis ranges as the student");
     const viaJson = (x) => JSON.parse(JSON.stringify(x)); // −0 and 0 are the same value on the server
     assert.deepEqual(viaJson(tv.eps), viaJson(studentView.eps), "same equivalence points");
-    const part = (s) => s.match(/V = [\d,]+ cm³/)[0] + " | " + s.match(/dĨ\/dV = [−\d,]+ mA\/cm³/)[0];
+    const part = (s) => s.match(/Vvalós = [\d,]+ cm³/)[0] + " | " + s.match(/Meredekség = [−\d,]+/)[0];
     assert.equal(part(tv.ep1), part(studentView.ep1));
     assert.equal(part(tv.ep2), part(studentView.ep2));
     assert.match(tv.head, /Ĩ \/ mA/);
-    assert.match(tv.head, /dĨ\/dV/);
+    assert.match(tv.head, /Vvalós \/ cm³/);
+    assert.match(tv.head, /Meredekség/);
     const s = fake.gas.post({ action: "list", password: "titok" }).students.find((x) => x.name === NAME);
     assert.equal(s.submitted, true);
     assert.equal(s.points, 43);
